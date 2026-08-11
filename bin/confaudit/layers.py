@@ -6,6 +6,7 @@ The ONLY module of the package, with `applog.py`, allowed to touch the disk
 
 import os
 
+from .confparser import decode_conf_bytes, parse_conf_text
 from .model import LayerFile
 
 
@@ -21,16 +22,18 @@ class LocalFileSystem:
         etc/system/default/<c>.conf
 
     `etc/users` is EXCLUDED (D-1: btool in global context ignores the user
-    layer, M-1). Every app present on disk is enumerated, with NO filtering on
-    its activation state (reserve R-7, accepted by D-14: the confrontation
-    would signal a divergence). Symbolic links are resolved by the OS, with no
-    special treatment.
+    layer, M-1). Disabled apps are EXCLUDED: reserve R-7 was settled
+    empirically against the real btool 9.4.6 (lab acceptance, 2026-08-12,
+    adjustment planned by D-14) - btool ignores an app whose `[install] state`
+    does not resolve to exactly `enabled` (see `_app_enabled`). Symbolic links
+    are resolved by the OS, with no special treatment.
     """
 
     def __init__(self, splunk_home=None):
         home = splunk_home or os.environ.get("SPLUNK_HOME", "")
         self.etc_root = os.path.join(home, "etc")
         self._apps_root = os.path.join(self.etc_root, "apps")
+        self._app_names_cache = None
 
     # -- FsPort ---------------------------------------------------------- #
 
@@ -75,14 +78,41 @@ class LocalFileSystem:
             yield os.path.join(self._apps_root, app, "default")
 
     def _app_names(self):
-        try:
-            entries = sorted(os.listdir(self._apps_root))
-        except OSError:
-            return []
-        return [
-            name for name in entries
-            if os.path.isdir(os.path.join(self._apps_root, name))
-        ]
+        if self._app_names_cache is None:
+            try:
+                entries = sorted(os.listdir(self._apps_root))
+            except OSError:
+                entries = []
+            self._app_names_cache = [
+                name for name in entries
+                if os.path.isdir(os.path.join(self._apps_root, name))
+                and self._app_enabled(name)
+            ]
+        return self._app_names_cache
+
+    def _app_enabled(self, app):
+        """btool participation rule, measured on 9.4.6 (lab acceptance, R-7).
+
+        An app takes part in the btool resolution if and only if its
+        `[install] state` - resolved on the app's own `app.conf` layers,
+        `local` over `default` - is absent (absent file, stanza or key means
+        enabled) or equals exactly `enabled`. Any other value excludes the
+        app: `disabled`, of course, but also case variants (`Enabled`,
+        `Disabled`) and unknown values (`foo`), all measured as excluding.
+        """
+        state = None
+        for layer in ("default", "local"):
+            path = os.path.join(self._apps_root, app, layer, "app.conf")
+            try:
+                with open(path, "rb") as handle:
+                    data = handle.read()
+            except OSError:
+                continue
+            text, _ = decode_conf_bytes(data)
+            for definition in parse_conf_text(text):
+                if definition.stanza == "install" and definition.key == "state":
+                    state = definition.value
+        return state is None or state == "enabled"
 
     @staticmethod
     def _conf_names_in(directory):
