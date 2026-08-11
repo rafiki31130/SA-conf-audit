@@ -13,8 +13,12 @@ the real btool.
 5. duplicated stanza in one file (distinct keys AND same key redefined, R-2);
 6. multi-line value (continuation, space before `\\`);
 7. (R-4/D-11) local redefinition of a `[default]` key, same value and file;
-8. (R-1) micro-syntax: `;` comment, blank-preceded comment lookalike, text
-   after `]`, trailing value spaces.
+8. (R-1) micro-syntax: `;` comment, blank-preceded comment, text after `]`,
+   trailing value spaces, `\\` followed by a blank. The R-1 verdicts were
+   settled against the real btool 9.4.6 (lab acceptance, 2026-08-12):
+   blank-preceded comments are ignored, trailing value blanks are stripped
+   at the end of the logical value, `\\` + blank is not a continuation and
+   the `\\` is kept literally.
 """
 
 import os
@@ -48,8 +52,8 @@ EXPECTED_WINNERS = {
     (ZZ_L, "ref_s2", "case3_key", "zz_local"),
     (A00_L, "ref_s2", "case6_multi", "line_one \nline_two_continuation"),
     (ZZ_L, "ref_s3", "case7_key", "same_val"),
-    (SYS_D, "ref_s4", "# indented", "commentish"),
-    (SYS_D, "ref_s4", "case8_trail", "value_with_trailing   "),
+    (SYS_D, "ref_s4", "case8_bs", "val_bs\\"),
+    (SYS_D, "ref_s4", "case8_trail", "value_with_trailing"),
 }
 
 
@@ -107,7 +111,7 @@ class SimulatedOutputConformanceTest(unittest.TestCase):
     def test_separator_is_space_equals_space(self):
         parsed = parse_btool_output(_build_ports()[2], ETC)
         record = parsed.stanzas["ref_s4"]["case8_trail"]
-        self.assertEqual(record.value, "value_with_trailing   ")
+        self.assertEqual(record.value, "value_with_trailing")
 
 
 class ReferenceSetTest(unittest.TestCase):
@@ -186,14 +190,15 @@ class ReferenceSetTest(unittest.TestCase):
         self.assertEqual(len(default_rows), 1)
 
     def test_case8_micro_syntax(self):
+        # R-1 verdicts, measured against real btool 9.4.6 (lab acceptance):
         # `;` comment ignored; text after `]` ignored (stanza is ref_s4);
-        # trailing value spaces preserved; the blank-preceded comment
-        # lookalike parses as a definition per the literal rule of
-        # section 4.1 (frozen by R-1, settled against real btool in phase 3).
+        # trailing value blanks stripped; blank-preceded comment ignored;
+        # `\` + blank is not a continuation, the `\` is kept literally.
         trail = self.by_group[("ref_s4", "case8_trail")]
-        self.assertEqual(trail[0]["value"], "value_with_trailing   ")
-        indented = self.by_group[("ref_s4", "# indented")]
-        self.assertEqual(indented[0]["value"], "commentish")
+        self.assertEqual(trail[0]["value"], "value_with_trailing")
+        bs = self.by_group[("ref_s4", "case8_bs")]
+        self.assertEqual(bs[0]["value"], "val_bs\\")
+        self.assertNotIn(("ref_s4", "# indented"), self.by_group)
         self.assertNotIn(("; semicolon comment at column zero", ""),
                          self.by_group)
 

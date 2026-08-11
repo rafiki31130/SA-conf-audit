@@ -4,11 +4,13 @@ Pure, sequential. Input: decoded text. Output: the list of *effective*
 definitions of the file - intra-file duplicates already merged, last occurrence
 winning (section 4.4, reserve R-2 arbitrated by D-14).
 
-The micro-tolerances not covered by the lab measurements (comment preceded by
-blanks, text after `]`, ...) follow the literal rule of section 4.1 - the most
-plausible reading of the documented Splunk behavior. They are frozen in the
-reference conf set (case 8), which the lab acceptance run compares against the
-real btool (reserve R-1, arbitrated by D-14).
+The micro-tolerances frozen by reserve R-1 were settled empirically against
+the real btool (9.4.6) during the lab acceptance run: a line whose first
+NON-BLANK character is `#` or `;` is a comment (not only column 0); the
+trailing blanks of a value are stripped at the END of the logical value
+(intermediate segments of a multi-line value keep theirs); a `\\` followed by
+blanks is not a continuation and the `\\` is kept as a literal character;
+text after the last `]` of a header is ignored.
 """
 
 from .model import RawDef
@@ -75,8 +77,10 @@ def parse_conf_text(text):
                 pending = None
             continue
 
-        # 2. Comment: `#` or `;` at column 0, before any blank (section 4.1).
-        if line[:1] in ("#", ";"):
+        # 2. Comment: first NON-BLANK character `#` or `;`. Measured against
+        # the real btool 9.4.6 (lab acceptance, R-1): an indented
+        # `  # k = v` or `  ; k = v` yields no definition.
+        if line.lstrip(_BLANKS)[:1] in ("#", ";"):
             continue
 
         # 3. Blank line.
@@ -101,9 +105,12 @@ def parse_conf_text(text):
             if key == "":
                 # A line starting with `=` carries no key: ignored.
                 continue
-            # Leading blanks only are stripped from the value: btool keeps the
-            # trailing spaces up to the end of line (M-3e), and stripping what
-            # btool keeps would create false `resolver_mismatch`.
+            # Leading blanks are stripped here; the trailing blanks of the
+            # LOGICAL value are stripped by `_store` - btool strips them at
+            # the end of the value (measured on 9.4.6, lab acceptance, R-1:
+            # `include.results_link = 1 ` in system/default is restituted
+            # as `1`), and keeping what btool strips would create false
+            # `resolver_mismatch`.
             value = value.lstrip(_BLANKS)
             if value.endswith("\\"):
                 # Continuation opens: the `\` must be the LAST character - a
@@ -130,6 +137,13 @@ def parse_conf_text(text):
 
 
 def _store(stanzas, stanza, key, value, lineno):
-    """Record one definition; the last occurrence read wins (section 4.4, R-2)."""
+    """Record one definition; the last occurrence read wins (section 4.4, R-2).
+
+    The end of the logical value is stripped of its trailing blanks - btool
+    behavior measured on 9.4.6 (lab acceptance, R-1), uniform across mono-line
+    values, the last segment of a multi-line value, and a value closed by a
+    `\\` at end of file. `rstrip(" \\t")` stops at the first `\\n`, so the
+    intermediate segments of a multi-line value keep their spaces (M-3d).
+    """
     keys = stanzas.setdefault(stanza, {})
-    keys[key] = (value, lineno)
+    keys[key] = (value.rstrip(_BLANKS), lineno)

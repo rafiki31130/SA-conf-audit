@@ -36,14 +36,24 @@ class ContinuationTest(unittest.TestCase):
         self.assertNotIn(("not a stanza", "key"), defs)
 
     def test_backslash_on_last_line_of_file_closes_the_value(self):
+        # Measured (lab acceptance, R-1): `xx \` at EOF -> btool restitutes
+        # `xx` - the `\` is consumed and the end of the value is stripped.
         defs = _defs("[s]\nkey = dangling \\")
-        self.assertEqual(defs[("s", "key")], "dangling ")
+        self.assertEqual(defs[("s", "key")], "dangling")
 
     def test_backslash_followed_by_blanks_is_not_a_continuation(self):
-        # The LAST character is not `\` (section 4.3).
+        # The LAST character is not `\` (section 4.3). Measured (lab
+        # acceptance, R-1): `foo\ ` -> btool restitutes `foo\` - literal
+        # backslash kept, trailing blank stripped, next line untouched.
         defs = _defs("[s]\nkey = not_continued\\ \nother = x\n")
-        self.assertEqual(defs[("s", "key")], "not_continued\\ ")
+        self.assertEqual(defs[("s", "key")], "not_continued\\")
         self.assertEqual(defs[("s", "other")], "x")
+
+    def test_trailing_blanks_of_last_continuation_segment_are_stripped(self):
+        # Measured (lab acceptance, R-1): `a \` then `b  ` -> `a \nb`.
+        defs = _defs("[s]\nkey = a \\\nb  \nafter = ok\n")
+        self.assertEqual(defs[("s", "key")], "a \nb")
+        self.assertEqual(defs[("s", "after")], "ok")
 
 
 class DefaultStanzaTest(unittest.TestCase):
@@ -88,6 +98,14 @@ class LineClassificationTest(unittest.TestCase):
     def test_semicolon_comment_at_column_zero(self):
         self.assertEqual(_defs("; k = v\n"), {})
 
+    def test_blank_preceded_hash_comment_is_ignored(self):
+        # Measured against real btool 9.4.6 (lab acceptance, R-1): an
+        # indented `  # k = v` yields no definition.
+        self.assertEqual(_defs("[s]\n   # k = v\n"), {})
+
+    def test_blank_preceded_semicolon_comment_is_ignored(self):
+        self.assertEqual(_defs("[s]\n\t; k = v\n"), {})
+
     def test_line_starting_with_equals_is_ignored(self):
         self.assertEqual(_defs("[s]\n=value\n"), {})
 
@@ -111,9 +129,19 @@ class ValueEdgeTest(unittest.TestCase):
         defs = _defs("[s]\nk =\n")
         self.assertEqual(defs[("s", "k")], "")
 
-    def test_trailing_spaces_are_preserved(self):
+    def test_trailing_spaces_are_stripped(self):
+        # Measured (lab acceptance, R-1): btool strips the trailing blanks
+        # of a value - `include.results_link = 1 ` restituted as `1`.
         defs = _defs("[s]\nk = value_with_trailing   \n")
-        self.assertEqual(defs[("s", "k")], "value_with_trailing   ")
+        self.assertEqual(defs[("s", "k")], "value_with_trailing")
+
+    def test_trailing_tab_is_stripped(self):
+        defs = _defs("[s]\nk = tabval\t\n")
+        self.assertEqual(defs[("s", "k")], "tabval")
+
+    def test_blanks_only_value_is_empty(self):
+        defs = _defs("[s]\nk =  \n")
+        self.assertEqual(defs[("s", "k")], "")
 
     def test_tabs_are_blanks_in_key_and_leading_value_strips(self):
         defs = _defs("[s]\n\tk\t=\tv\n")

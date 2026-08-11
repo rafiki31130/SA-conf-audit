@@ -22,7 +22,7 @@ line_two_continuation
 /opt/splunk/etc/apps/00_corp_base/default/refconf.conf  case4_orphan = orphan_val
 /opt/splunk/etc/apps/zz_sample_app/local/refconf.conf   case7_key = same_val
 /opt/splunk/etc/system/default/refconf.conf             [ref_s4]
-/opt/splunk/etc/system/default/refconf.conf             # indented = commentish
 /opt/splunk/etc/apps/00_corp_base/default/refconf.conf  case4_orphan = orphan_val
 /opt/splunk/etc/apps/zz_sample_app/local/refconf.conf   case7_key = same_val
-/opt/splunk/etc/system/default/refconf.conf             case8_trail = value_with_trailing   
+/opt/splunk/etc/system/default/refconf.conf             case8_bs = val_bs\
+/opt/splunk/etc/system/default/refconf.conf             case8_trail = value_with_trailing
