@@ -1,0 +1,28 @@
+/opt/splunk/etc/apps/zz_sample_app/local/refconf.conf   [default]
+/opt/splunk/etc/apps/00_corp_base/default/refconf.conf  case4_orphan = orphan_val
+/opt/splunk/etc/apps/zz_sample_app/local/refconf.conf   case7_key = same_val
+/opt/splunk/etc/apps/zz_sample_app/default/refconf.conf [ref_dup]
+/opt/splunk/etc/apps/00_corp_base/default/refconf.conf  case4_orphan = orphan_val
+/opt/splunk/etc/apps/zz_sample_app/default/refconf.conf case5_a = a1
+/opt/splunk/etc/apps/zz_sample_app/default/refconf.conf case5_b = b2
+/opt/splunk/etc/apps/zz_sample_app/default/refconf.conf case5_same = second
+/opt/splunk/etc/apps/zz_sample_app/local/refconf.conf   case7_key = same_val
+/opt/splunk/etc/system/local/refconf.conf               [ref_s1]
+/opt/splunk/etc/system/local/refconf.conf               case1_key = sys_local_wins
+/opt/splunk/etc/apps/00_corp_base/local/refconf.conf    case2_key = from_00
+/opt/splunk/etc/apps/00_corp_base/default/refconf.conf  case4_orphan = orphan_val
+/opt/splunk/etc/apps/zz_sample_app/local/refconf.conf   case7_key = same_val
+/opt/splunk/etc/apps/00_corp_base/local/refconf.conf    [ref_s2]
+/opt/splunk/etc/apps/zz_sample_app/local/refconf.conf   case3_key = zz_local
+/opt/splunk/etc/apps/00_corp_base/default/refconf.conf  case4_orphan = orphan_val
+/opt/splunk/etc/apps/00_corp_base/local/refconf.conf    case6_multi = line_one 
+line_two_continuation
+/opt/splunk/etc/apps/zz_sample_app/local/refconf.conf   case7_key = same_val
+/opt/splunk/etc/apps/zz_sample_app/local/refconf.conf   [ref_s3]
+/opt/splunk/etc/apps/00_corp_base/default/refconf.conf  case4_orphan = orphan_val
+/opt/splunk/etc/apps/zz_sample_app/local/refconf.conf   case7_key = same_val
+/opt/splunk/etc/system/default/refconf.conf             [ref_s4]
+/opt/splunk/etc/system/default/refconf.conf             # indented = commentish
+/opt/splunk/etc/apps/00_corp_base/default/refconf.conf  case4_orphan = orphan_val
+/opt/splunk/etc/apps/zz_sample_app/local/refconf.conf   case7_key = same_val
+/opt/splunk/etc/system/default/refconf.conf             case8_trail = value_with_trailing   
