@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Per-instance local configuration (secrets patterns, log level, verify_ssl, ...).
+local/
+
+# Logs produced at run time.
+*.log

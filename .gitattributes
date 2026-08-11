@@ -1,0 +1,21 @@
+# Text files are normalized to LF. Fixture files under tests/fixtures/ carry
+# meaningful byte-level content (trailing spaces, continuations) and are marked
+# below so no conversion ever alters them.
+* text=auto eol=lf
+
+# Vendored dependencies: stored byte for byte, never converted. Any line-ending
+# conversion would invalidate bin/lib/MANIFEST.sha256 at clone time.
+bin/lib/** -text
+
+# Test fixtures: byte-exact content (trailing spaces, \ continuations, invalid
+# UTF-8 sequences). Never converted.
+tests/fixtures/** -text
+
+# Scope of the deployable archive (spec section 2.1): the .spl carries default/,
+# bin/, metadata/, README.md and LICENSE; tests/ and tools/ live in the
+# repository only. `git archive` therefore leaves them out, along with the
+# repository's own service files.
+tests/         export-ignore
+tools/         export-ignore
+.gitattributes export-ignore
+.gitignore     export-ignore
