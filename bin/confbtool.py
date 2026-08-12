@@ -51,7 +51,12 @@ from confaudit.rest import RestClient  # noqa: E402
 _APP_ROOT = os.path.dirname(_BIN)
 
 
-@Configuration(distributed=False)
+# `type='events'` (D-16): the command generates EVENTS, not a statistical
+# table - `| confbtool ...` lands in the Events tab, like any first command of
+# an events pipeline. An events-typed generating command is never distributed
+# (the SDK drops `distributed` from the metadata for this type), which keeps
+# the `distributed=false` requirement of the CDC satisfied by construction.
+@Configuration(type="events")
 class ConfBtoolCommand(GeneratingCommand):
     """Audit the file origin of configuration definitions, like btool --debug.
 
@@ -93,16 +98,18 @@ class ConfBtoolCommand(GeneratingCommand):
         default=None,
     )
     audit = Option(
-        doc="true: emit every concurrent definition, winners and shadowed. "
+        doc="true: emit every concurrent definition, winners and shadowed, "
+            "plus the three verdict fields; implies debug=true. "
             "Default: false (winners only).",
         require=False,
         default=False,
         validate=validators.Boolean(),
     )
     debug = Option(
-        doc="true (default): fill file_path on every row.",
+        doc="true: emit the file_path field. Default: false (the field is "
+            "absent, not empty). Forced to true by audit=true.",
         require=False,
-        default=True,
+        default=False,
         validate=validators.Boolean(),
     )
 
