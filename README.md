@@ -34,7 +34,10 @@ audit=true` gives it in one search.
    `LICENSE`).
 2. Restart Splunk (a new search command and a new capability are declared).
 3. Nothing else: the app grants the `run_confbtool` capability to the `admin`
-   role out of the box (`default/authorize.conf`).
+   role out of the box (`default/authorize.conf`), and exports the command
+   globally (`metadata/default.meta`, `export = system`) so that it can be
+   invoked from any app - the Search app in particular. Without that export a
+   search command is only usable from the context of the app that ships it.
 
 The command is **admin-only by design**: it exposes the file origin of every
 configuration parameter, which is administration data. Execution requires the
@@ -77,8 +80,13 @@ Two steps, both local decisions (never shipped by the app):
 - `stanza=`, `key=`, `app=` accept literal characters plus the wildcards `*`
   (any substring) and `?` (one character), case-sensitive. Defaults:
   `stanza=*`, `key=*`, `app=` absent.
-- `audit=` defaults to `false`, `debug=` defaults to `true` (`debug=false`
-  empties `file_path` on every row and changes nothing else).
+- `audit=` defaults to `false`. `debug=` defaults to **`false`**: the
+  `file_path` field is then **not emitted at all** - not emitted empty. A
+  field that is not relevant in a mode is absent from the results, because an
+  empty column stays visible in a result table and makes the option look
+  inert.
+- **`audit=true` implies `debug=true`**: reading a conflict without the path
+  makes no sense, so an explicit `debug=false` is ignored in audit mode.
 
 ### The `app=` x `audit=` matrix
 
@@ -93,24 +101,59 @@ competition on those keys. A key the app does not carry never appears.
 Filters never prune the analysis: rank, winner verdict and definition count
 are always computed on the real, complete set of layers.
 
-### Output fields (one row per definition)
+### Output fields (one event per definition)
 
-`file_path`, `conf`, `stanza`, `key`, `value`, `scope` (`system`|`app`),
-`app`, `layer` (`local`|`default`), `precedence_rank` (1 = strongest),
-`is_btool_winner` (`true`|`false`, the btool verdict), `btool_winner_path`,
-`btool_winner_value` (the winner, repeated on every row of the group),
-`definition_count` (number of concurrent definitions of the key), `member`,
-`anomaly` (empty, `parse_error` or `resolver_mismatch`).
+| Field | Emitted | Meaning |
+|---|---|---|
+| `file_path` | `debug=true` **or** `audit=true` | absolute path of the file carrying the definition |
+| `conf` | always | conf name, without the `.conf` |
+| `stanza` | always | stanza name (`default` for keys written before any header) |
+| `key` | always | parameter name |
+| `value` | always | value, folded into one logical value, hashed if sensitive |
+| `scope` | always | `system` or `app` |
+| `app` | always | app name; **`system`** for `etc/system/{local,default}` |
+| `layer` | always | `local` or `default` |
+| `precedence_rank` | always | rank in the global precedence order, 1 = strongest |
+| `is_btool_winner` | `audit=true` | `true`/`false`, the btool verdict |
+| `btool_winner_path` | `audit=true` | the winner, repeated on every row of the group |
+| `btool_winner_value` | `audit=true` | idem |
+| `definition_count` | always | number of concurrent definitions of `(conf, stanza, key)` |
+| `member` | always | hostname of the member that ran the search |
+| `anomaly` | always | empty, `parse_error` or `resolver_mismatch` |
+
+In the default mode the three verdict fields would be constant
+(`is_btool_winner` is always `true` when only winners are emitted) or
+redundant with `file_path` and `value` of the very same row, so they are not
+emitted. `precedence_rank` and `definition_count` **are** emitted in every
+mode: they are what tells you a key is contested and worth a second look in
+`audit=true`.
 
 The output is strictly flat - directly usable by `stats`, `where`, `eval`,
-without transformation.
+without transformation. `| stats count by app` is right with no `eval` fix-up,
+including for the system layer. Note that `app=` stays a filter on **apps**:
+`app=system` selects nothing, `| where scope="system"` is the predicate for
+that layer.
+
+### Events, `_raw` and `_time`
+
+`| confbtool` is an **events**-generating command: its output lands in the
+Events tab, not in the statistics table. Every row carries a synthetic `_raw`
+- a readable reconstruction of the definition, `<file_path> [<stanza>] <key> =
+<value>` (or `<conf>.conf [...]` when `debug=false`, so the raw text never
+leaks the path the mode withholds).
+
+**No `_time` is ever produced.** A configuration definition has no timestamp
+and none is invented. Measured on Splunk 9.4.6: the events pipeline needs
+neither `_raw` nor `_time` - `_raw` is added purely so the Events tab has
+something to display. Searches over this output must therefore not rely on a
+time range.
 
 ## Typical audits
 
-Winning `authorize.conf` definitions, with their origin:
+Winning `authorize.conf` definitions - add `debug=true` for the file origin:
 
 ```
-| confbtool authorize
+| confbtool authorize debug=true
 ```
 
 Full competition on one key - who wins, who is shadowed, from where:
@@ -158,7 +201,8 @@ flowchart TD
     J --> K["Volume guard<br/>row count vs maxresultrows"]
     K -- over limit --> K1["Explicit refusal, no partial output"]
     K --> L["Secret hashing<br/>encrypt_fields + configurable patterns<br/>-> sha256:hexdigest"]
-    L --> M["Sorted emission<br/>conf, stanza, key, precedence_rank"]
+    L --> N["Field set of the mode<br/>file_path if debug, verdict fields if audit,<br/>synthetic _raw - same keys on every row"]
+    N --> M["Sorted emission<br/>conf, stanza, key, precedence_rank"]
 ```
 
 Layer precedence, the one btool applies outside of any app/user context:
@@ -222,9 +266,10 @@ verify_ssl = true
   like btool. A parameter changed on disk but not reloaded (or the reverse)
   is reported as the disk sees it. The same applies to the volume limit,
   read from `limits.conf` on disk.
-- **Deactivated apps are enumerated**: every app present on disk participates,
-  whatever its activation state, matching the observed btool behavior on the
-  validated version. A divergence would surface as `resolver_mismatch`.
+- **Deactivated apps are excluded**: an app whose `[install] state` resolves
+  to anything other than `enabled` takes no part in the resolution, which is
+  the behavior measured on the validated version of btool. A divergence would
+  surface as `resolver_mismatch`.
 - **`parse_error` can entail legitimate `resolver_mismatch`**: on a file with
   a degraded encoding, the command extracts what it can and btool parses the
   file its own way; the two views may differ. Those `resolver_mismatch` rows
@@ -244,7 +289,11 @@ python -m unittest discover -s tests
 ```
 
 `tests/fixtures/` carries a synthetic reference conf set and a simulated
-btool output conforming to the measured `--debug` format. `tools/vendor.sh`
+btool output conforming to the measured `--debug` format.
+`tests/labdata/` carries a synthetic **exploration** data set for a lab
+instance - the same stanzas and keys defined across several apps and layers,
+with a README listing the searches that show each case, and a script that
+deploys and removes it in one gesture. `tools/vendor.sh`
 rebuilds the vendored SDK reproducibly; `tools/verify_vendor.sh` checks it
 against `bin/lib/MANIFEST.sha256`.
 
