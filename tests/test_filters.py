@@ -109,7 +109,26 @@ class PatternValidationTest(unittest.TestCase):
         self.assertEqual(params.key_raw, "*")
         self.assertIsNone(params.app_rx)
         self.assertFalse(params.audit)
+        # D-17: `debug` defaults to FALSE - the path is an investigation
+        # detail, not front-page information.
+        self.assertFalse(params.debug)
+
+
+class AuditImpliesDebugTest(unittest.TestCase):
+    """D-18: `audit=true` forces `debug=true`, resolved once in
+    `validate_params`; `Params.debug` is the effective value."""
+
+    def test_audit_true_forces_debug_even_when_explicitly_false(self):
+        params = filters.validate_params(["probe"], audit=True, debug=False)
         self.assertTrue(params.debug)
+
+    def test_audit_true_without_debug_argument_forces_it_too(self):
+        self.assertTrue(filters.validate_params(["probe"], audit=True).debug)
+
+    def test_debug_true_alone_does_not_turn_audit_on(self):
+        params = filters.validate_params(["probe"], debug=True)
+        self.assertTrue(params.debug)
+        self.assertFalse(params.audit)
 
 
 class MatrixTest(unittest.TestCase):

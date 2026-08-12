@@ -20,7 +20,7 @@ import time
 from . import btoolparser, confparser, filters, resolver, volume
 from .confront import confront
 from .errors import FatalBtoolError, FatalCapabilityError
-from .model import STAR, AppSettings
+from .model import RAW_FIELD, STAR, SYSTEM_APP, AppSettings, output_fields
 from .secrets import (
     SecretMatcher,
     parse_encrypt_fields,
@@ -111,7 +111,7 @@ def _parse_bool(raw, default):
 
 
 def run(fs, btool, rest, fieldnames, stanza=None, key=None, app=None,
-        audit=False, debug=True, settings=None, member="", etc_prefix="",
+        audit=False, debug=False, settings=None, member="", etc_prefix="",
         log=None, emit=None):
     """Execute the whole flow of spec section 1.2; return the ordered rows.
 
@@ -221,13 +221,31 @@ def run(fs, btool, rest, fieldnames, stanza=None, key=None, app=None,
 
     # 8. Row construction: secret hashing happens here, after the
     # confrontation (raw values) and before the emission (spec section 9.2).
+    #
+    # The field set is computed ONCE for the whole run (D-17, D-18) and every
+    # row is projected onto it, so all rows of one invocation carry exactly the
+    # same keys, in the same order. This is not cosmetic: the chunked writer of
+    # the SDK freezes the column header on the FIRST record of a chunk and
+    # silently blanks whatever a later record adds - a heterogeneous row set
+    # would produce results depending on the emission order.
+    fields = output_fields(params.audit, params.debug)
     rows = []
     for conf, layer_file in parse_errors:
-        rows.append(_parse_error_row(conf, layer_file, member, params))
+        rows.append(
+            _project(_parse_error_row(conf, layer_file, member), fields,
+                     params.debug)
+        )
     for group, index, verdict in selected:
-        rows.append(_definition_row(group, index, verdict, member, params, matcher))
+        rows.append(
+            _project(
+                _definition_row(group, index, verdict, member, matcher),
+                fields, params.debug,
+            )
+        )
     for anomaly in anomalies:
-        rows.append(_mismatch_row(anomaly, member, params, matcher))
+        rows.append(
+            _project(_mismatch_row(anomaly, member, matcher), fields, params.debug)
+        )
 
     # 9. Emission order (spec section 3.2): conf, stanza, key,
     # precedence_rank, code-point string comparisons. `parse_error` rows
@@ -241,6 +259,35 @@ def run(fs, btool, rest, fieldnames, stanza=None, key=None, app=None,
             emit(row)
         return len(rows)
     return rows
+
+
+def _project(row, fields, debug):
+    """Keep only `fields`, in the order of `fields` (D-17, D-18), `_raw` first.
+
+    A field that is not relevant in the current mode is ABSENT from the record,
+    never present with an empty value: an empty column stays visible in a
+    result table, which is exactly what made `debug=` look like it did nothing.
+    """
+    row[RAW_FIELD] = _synthetic_raw(row, debug)
+    return {name: row[name] for name in fields}
+
+
+def _synthetic_raw(row, debug):
+    """Readable reconstruction of the definition, for the Events tab (D-16).
+
+    `<file_path> [<stanza>] <key> = <value>` when the path is emitted, else
+    `<conf>.conf [...]`: the raw text NEVER carries the path when `debug` is
+    false, otherwise it would leak through `_raw` exactly what `debug=false`
+    withholds. The value is the one already carried by the row, so a hashed
+    secret stays hashed here too.
+    """
+    prefix = row["file_path"] if debug else row["conf"] + ".conf"
+    if row["anomaly"] == "parse_error":
+        return "%s unreadable or undecodable (anomaly=parse_error)" % prefix
+    text = "%s [%s] %s = %s" % (prefix, row["stanza"], row["key"], row["value"])
+    if row["anomaly"]:
+        return "%s (anomaly=%s)" % (text, row["anomaly"])
+    return text
 
 
 def _sort_key(row):
@@ -329,20 +376,24 @@ def _build_secret_matcher(fs, settings, log):
     return SecretMatcher(rules=rules, settings=settings)
 
 
-def _definition_row(group, index, verdict, member, params, matcher):
+def _definition_row(group, index, verdict, member, matcher):
+    """Full row of one definition; `_project` then drops the fields the mode
+    does not emit. Every field is computed unconditionally - the mode governs
+    what is EMITTED, never what is COMPUTED (the btool confrontation runs in
+    both modes, it is what feeds `is_btool_winner` and the audit itself)."""
     definition = group.defs[index]
     sensitive = matcher.is_sensitive(group.conf, group.stanza, group.key)
     winner = verdict.winner
     winner_path = winner.path if winner is not None else ""
     winner_value = winner.value if winner is not None else ""
     return {
-        "file_path": definition.path if params.debug else "",
+        "file_path": definition.path,
         "conf": group.conf,
         "stanza": group.stanza,
         "key": group.key,
         "value": hash_value(definition.value) if sensitive else definition.value,
         "scope": definition.scope,
-        "app": definition.app,
+        "app": definition.app or SYSTEM_APP,
         "layer": definition.layer,
         "precedence_rank": index + 1,
         "is_btool_winner": "true" if verdict.index == index else "false",
@@ -357,18 +408,18 @@ def _definition_row(group, index, verdict, member, params, matcher):
     }
 
 
-def _parse_error_row(conf, layer_file, member, params):
+def _parse_error_row(conf, layer_file, member):
     """`parse_error` row (spec section 3.2): file identity filled, definition
     fields empty. Never filtered by `stanza=`/`key=`/`app=` nor by `audit` - an
     unparsed file may concern any key, silencing it would skew the audit."""
     return {
-        "file_path": layer_file.path if params.debug else "",
+        "file_path": layer_file.path,
         "conf": conf,
         "stanza": "",
         "key": "",
         "value": "",
         "scope": layer_file.scope,
-        "app": layer_file.app,
+        "app": layer_file.app or SYSTEM_APP,
         "layer": layer_file.layer,
         "precedence_rank": "",
         "is_btool_winner": "",
@@ -380,7 +431,7 @@ def _parse_error_row(conf, layer_file, member, params):
     }
 
 
-def _mismatch_row(anomaly, member, params, matcher):
+def _mismatch_row(anomaly, member, matcher):
     """`resolver_mismatch` row: both verdicts side by side (spec section 3.2).
 
     Internal side = rank-1 definition when it exists; btool side = btool
@@ -391,15 +442,13 @@ def _mismatch_row(anomaly, member, params, matcher):
     value = internal.value if internal is not None else ""
     winner_value = winner.value if winner is not None else ""
     return {
-        "file_path": (
-            internal.path if internal is not None and params.debug else ""
-        ),
+        "file_path": internal.path if internal is not None else "",
         "conf": anomaly.conf,
         "stanza": anomaly.stanza,
         "key": anomaly.key,
         "value": hash_value(value) if sensitive and internal is not None else value,
         "scope": internal.scope if internal is not None else "",
-        "app": internal.app if internal is not None else "",
+        "app": (internal.app or SYSTEM_APP) if internal is not None else "",
         "layer": internal.layer if internal is not None else "",
         "precedence_rank": "",
         "is_btool_winner": "",

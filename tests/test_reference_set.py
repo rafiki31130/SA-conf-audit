@@ -76,11 +76,12 @@ def _build_ports():
     return fs, FakeBtool({"refconf": output}), output
 
 
-def _run(audit):
+def _run(audit, debug=False):
     fs, btool, _ = _build_ports()
     return pipeline.run(
         fs=fs, btool=btool, rest=FakeRest(), fieldnames=["refconf"],
-        audit=audit, member="member-01", etc_prefix=ETC, log=CollectingLog(),
+        audit=audit, debug=debug, member="member-01", etc_prefix=ETC,
+        log=CollectingLog(),
     )
 
 
@@ -210,7 +211,11 @@ class ReferenceSetTest(unittest.TestCase):
         self.assertEqual(winners, EXPECTED_WINNERS)
 
     def test_default_run_emits_winners_only(self):
-        rows = _run(audit=False)
+        # `debug=true` because the criterion-1 projection is the quadruplet
+        # (file_path, stanza, key, value): in `audit=false` the path is only
+        # emitted when it is asked for (D-17). The winner SET is what is under
+        # test here, and it does not depend on `debug`.
+        rows = _run(audit=False, debug=True)
         self.assertEqual(
             {(r["file_path"], r["stanza"], r["key"], r["value"]) for r in rows},
             EXPECTED_WINNERS,

@@ -1,9 +1,11 @@
 """End-to-end pipeline over the in-memory ports (spec sections 1.2, 3.2, 10).
 
 Covers: capability gate (exact message), btool failure (exact message, D-13),
-row shape and emission order, `debug=false`, `parse_error` never filtered,
-rank/count insensitive to filters, secrets end-to-end (`value` AND
-`btool_winner_value` hashed, no raw sensitive value in any row), upstream
+row shape and emission order, the CONDITIONAL field set of D-17/D-18 (asserted
+on the keys present, never on their content), the synthetic `_raw` and the
+absence of any fabricated `_time` (D-16), `app=system` (D-19), `parse_error`
+never filtered, rank/count insensitive to filters, secrets end-to-end (`value`
+AND `btool_winner_value` hashed, no raw sensitive value in any row), upstream
 pruning, member field.
 """
 
@@ -100,16 +102,18 @@ class BtoolFailureTest(unittest.TestCase):
 
 class RowShapeTest(unittest.TestCase):
 
-    def test_fifteen_fields_in_contract_order(self):
+    def test_fifteen_fields_in_contract_order_in_audit_mode(self):
         from confaudit.model import OUTPUT_FIELDS
         fs, btool, _ = _simple_fixture()
-        rows = _run(fs, btool)
+        rows = _run(fs, btool, audit=True)
         self.assertEqual(len(OUTPUT_FIELDS), 15)
-        self.assertEqual(tuple(rows[0].keys()), OUTPUT_FIELDS)
+        # `_raw` leads every row (D-16); it is a rendering affordance, not a
+        # sixteenth contract field.
+        self.assertEqual(tuple(rows[0].keys()), ("_raw",) + OUTPUT_FIELDS)
 
     def test_nominal_row_content(self):
         fs, btool, path = _simple_fixture()
-        row = _run(fs, btool)[0]
+        row = _run(fs, btool, audit=True)[0]
         self.assertEqual(row["file_path"], path)
         self.assertEqual(row["conf"], "probe")
         self.assertEqual(row["stanza"], "s")
@@ -125,14 +129,6 @@ class RowShapeTest(unittest.TestCase):
         self.assertEqual(row["definition_count"], 1)
         self.assertEqual(row["member"], "member-01")
         self.assertEqual(row["anomaly"], "")
-
-    def test_debug_false_empties_file_path_only(self):
-        fs, btool, path = _simple_fixture()
-        row = _run(fs, btool, debug=False)[0]
-        self.assertEqual(row["file_path"], "")
-        # btool is still invoked and the verdict fields stay filled.
-        self.assertEqual(row["btool_winner_path"], path)
-        self.assertEqual(row["is_btool_winner"], "true")
 
     def test_winner_fields_on_every_row_of_the_group(self):
         fs = FakeFs()
@@ -152,6 +148,181 @@ class RowShapeTest(unittest.TestCase):
             [(1, "true"), (2, "false")],
         )
         self.assertEqual(rows[1]["file_path"], p_app)
+
+
+class ConditionalFieldsTest(unittest.TestCase):
+    """D-17/D-18, CDC v1.3 criterion 10: the output contract is CONDITIONAL.
+
+    Everything here asserts on the SET OF KEYS actually present in the rows,
+    never on their content - a field that is not relevant in a mode must be
+    ABSENT, not present and empty.
+    """
+
+    VERDICT = {"is_btool_winner", "btool_winner_path", "btool_winner_value"}
+    ALWAYS = {
+        "_raw",
+        "conf", "stanza", "key", "value", "scope", "app", "layer",
+        "precedence_rank", "definition_count", "member", "anomaly",
+    }
+
+    def test_default_mode_omits_file_path_and_the_verdict_fields(self):
+        fs, btool, _ = _simple_fixture()
+        keys = set(_run(fs, btool)[0])
+        self.assertNotIn("file_path", keys)
+        self.assertEqual(keys & self.VERDICT, set())
+        self.assertEqual(keys, self.ALWAYS)
+
+    def test_debug_true_adds_file_path_and_nothing_else(self):
+        fs, btool, path = _simple_fixture()
+        row = _run(fs, btool, debug=True)[0]
+        self.assertEqual(set(row), self.ALWAYS | {"file_path"})
+        self.assertEqual(row["file_path"], path)
+
+    def test_audit_true_adds_file_path_and_the_verdict_fields(self):
+        fs, btool, path = _simple_fixture()
+        row = _run(fs, btool, audit=True)[0]
+        self.assertEqual(set(row), self.ALWAYS | {"file_path"} | self.VERDICT)
+        self.assertEqual(row["file_path"], path)
+
+    def test_audit_true_ignores_an_explicit_debug_false(self):
+        fs, btool, path = _simple_fixture()
+        row = _run(fs, btool, audit=True, debug=False)[0]
+        self.assertIn("file_path", row)
+        self.assertEqual(row["file_path"], path)
+
+    def test_rank_and_count_stay_in_the_default_mode(self):
+        # Explicit CDP arbitration (D-18): they are the signal that makes one
+        # want to re-run in audit mode; removing them would hide conflicts.
+        fs = FakeFs()
+        p_sys = fs.add("system", "", "local", "probe", "[s]\nk = sys\n")
+        fs.add("app", "00_corp_base", "local", "probe", "[s]\nk = app\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (p_sys, "[s]"), (p_sys, "k = sys"),
+        ])})
+        row = _run(fs, btool)[0]
+        self.assertEqual(row["precedence_rank"], 1)
+        self.assertEqual(row["definition_count"], 2)
+
+    def test_every_row_of_one_run_carries_the_very_same_keys(self):
+        # The SDK's chunked writer freezes the column header on the FIRST
+        # record of a chunk: a heterogeneous row set would silently blank the
+        # fields the later rows add. Anomaly rows are the risky ones - they
+        # are built by other code paths.
+        fs = FakeFs()
+        bad = fs.add("app", "00_corp_base", "local", "probe", "[s]\nk = v\n")
+        fs.unreadable.add(bad)
+        p_ok = fs.add("app", "zz_sample_app", "local", "probe", "[s]\nk = zz\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (p_ok, "[s]"), (p_ok, "k = zz"),
+            (p_ok, "[ghost]"), (p_ok, "gk = gv"),
+        ])})
+        for kwargs in ({}, {"debug": True}, {"audit": True}):
+            fs.read_paths = []
+            rows = _run(fs, btool, **kwargs)
+            kinds = {row["anomaly"] for row in rows}
+            self.assertEqual(kinds, {"", "parse_error", "resolver_mismatch"})
+            shapes = {tuple(row.keys()) for row in rows}
+            self.assertEqual(len(shapes), 1, kwargs)
+
+
+class SyntheticRawTest(unittest.TestCase):
+    """D-16: `_raw` is a readable reconstruction of the definition; `_time` is
+    never fabricated - a configuration definition has no timestamp."""
+
+    def test_raw_carries_the_path_when_debug_is_on(self):
+        fs, btool, path = _simple_fixture()
+        row = _run(fs, btool, debug=True)[0]
+        self.assertEqual(row["_raw"], "%s [s] k = v1" % path)
+
+    def test_raw_never_leaks_the_path_when_debug_is_off(self):
+        fs, btool, path = _simple_fixture()
+        row = _run(fs, btool)[0]
+        self.assertEqual(row["_raw"], "probe.conf [s] k = v1")
+        self.assertNotIn(path, row["_raw"])
+
+    def test_no_row_ever_carries_a_time_field(self):
+        fs, btool, _ = _simple_fixture()
+        for kwargs in ({}, {"debug": True}, {"audit": True}):
+            for row in _run(fs, btool, **kwargs):
+                self.assertNotIn("_time", row)
+
+    def test_raw_of_a_sensitive_value_stays_hashed(self):
+        fs = FakeFs()
+        path = fs.add("app", "00_corp_base", "local", "probe",
+                      "[s]\nsslPassword = $7$cipher_text\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (path, "[s]"), (path, "sslPassword = $7$cipher_text"),
+        ])})
+        row = _run(fs, btool)[0]
+        self.assertNotIn("$7$cipher_text", row["_raw"])
+        self.assertIn(hash_value("$7$cipher_text"), row["_raw"])
+
+    def test_anomaly_rows_carry_a_readable_raw(self):
+        fs = FakeFs()
+        bad = fs.add("app", "00_corp_base", "local", "probe", "[s]\nk = v\n")
+        fs.unreadable.add(bad)
+        p_ok = fs.add("app", "zz_sample_app", "local", "probe", "[s]\nk = zz\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (p_ok, "[s]"), (p_ok, "k = zz"),
+        ])})
+        row = _run(fs, btool, debug=True)[0]
+        self.assertEqual(row["anomaly"], "parse_error")
+        self.assertEqual(
+            row["_raw"], "%s unreadable or undecodable (anomaly=parse_error)" % bad
+        )
+
+
+class SystemAppNameTest(unittest.TestCase):
+    """D-19: `app` reads `system` for the `etc/system/*` layers, never empty -
+    `| stats count by app` must be right with no `eval` fix-up."""
+
+    def test_system_layer_rows_carry_app_system(self):
+        fs = FakeFs()
+        p_sys = fs.add("system", "", "local", "probe", "[s]\nk = sys\n")
+        fs.add("system", "", "default", "probe", "[s]\nk = sysd\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (p_sys, "[s]"), (p_sys, "k = sys"),
+        ])})
+        rows = _run(fs, btool, audit=True)
+        self.assertEqual([row["app"] for row in rows], ["system", "system"])
+        self.assertEqual([row["scope"] for row in rows], ["system", "system"])
+
+    def test_app_layer_rows_keep_their_app_name(self):
+        fs, btool, _ = _simple_fixture()
+        self.assertEqual(_run(fs, btool)[0]["app"], "00_corp_base")
+
+    def test_parse_error_row_of_a_system_file_carries_app_system(self):
+        fs = FakeFs()
+        bad = fs.add("system", "", "local", "probe", "[s]\nk = v\n")
+        fs.unreadable.add(bad)
+        p_ok = fs.add("app", "00_corp_base", "local", "probe", "[s]\nk = ok\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (p_ok, "[s]"), (p_ok, "k = ok"),
+        ])})
+        rows = _run(fs, btool)
+        error_row = [row for row in rows if row["anomaly"] == "parse_error"][0]
+        self.assertEqual(error_row["app"], "system")
+
+    def test_no_emitted_row_carries_an_empty_app(self):
+        fs = FakeFs()
+        p_sys = fs.add("system", "", "local", "probe", "[s]\nk = sys\n")
+        fs.add("app", "00_corp_base", "default", "probe", "[s]\nk = app\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (p_sys, "[s]"), (p_sys, "k = sys"),
+        ])})
+        rows = _run(fs, btool, audit=True)
+        self.assertTrue(rows)
+        self.assertNotIn("", {row["app"] for row in rows})
+
+    def test_app_filter_stays_a_filter_on_apps(self):
+        # `app=system` selects nothing: `system` is a display value, not an
+        # app name (the btool CLI has no `--app=system` either).
+        fs = FakeFs()
+        p_sys = fs.add("system", "", "local", "probe", "[s]\nk = sys\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (p_sys, "[s]"), (p_sys, "k = sys"),
+        ])})
+        self.assertEqual(_run(fs, btool, app="system", audit=True), [])
 
 
 class RankCountFilterInsensitivityTest(unittest.TestCase):
@@ -200,7 +371,7 @@ class ParseErrorTest(unittest.TestCase):
 
     def test_unreadable_file_yields_parse_error_and_the_run_continues(self):
         fs, btool, bad = self._fixture()
-        rows = _run(fs, btool)
+        rows = _run(fs, btool, audit=True)
         anomalies = [row for row in rows if row["anomaly"] == "parse_error"]
         self.assertEqual(len(anomalies), 1)
         row = anomalies[0]
@@ -220,7 +391,8 @@ class ParseErrorTest(unittest.TestCase):
         # stanza=/key=/app= filters that match nothing, audit=false: the
         # parse_error row still comes out (spec section 4.6).
         fs, btool, bad = self._fixture()
-        rows = _run(fs, btool, stanza="no_match", key="no_match", app="no_match")
+        rows = _run(fs, btool, debug=True,
+                    stanza="no_match", key="no_match", app="no_match")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["anomaly"], "parse_error")
         self.assertEqual(rows[0]["file_path"], bad)

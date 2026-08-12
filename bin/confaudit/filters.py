@@ -78,14 +78,22 @@ def compile_filter(name, pattern):
 
 
 def validate_params(fieldnames, stanza=None, key=None, app=None,
-                    audit=False, debug=True):
+                    audit=False, debug=False):
     """Validate every invocation parameter into a `Params` (spec section 7.1).
 
-    Defaults: `stanza=*`, `key=*`, `app=` absent, `audit=false`, `debug=true`.
+    Defaults: `stanza=*`, `key=*`, `app=` absent, `audit=false`, `debug=false`
+    (D-17: the path is an investigation detail, not front-page information).
+
+    `audit=true` FORCES `debug=true` (D-18): reading a conflict without the
+    path makes no sense, so an explicit `debug=false` is ignored in that mode.
+    The implication is resolved once, here; `Params.debug` is the EFFECTIVE
+    value and every downstream module reads it as such.
     """
     confs = parse_conf_argument(fieldnames)
     stanza_raw = STAR if stanza is None else stanza
     key_raw = STAR if key is None else key
+    audit = bool(audit)
+    debug = bool(debug) or audit
     return Params(
         confs=confs,
         stanza_raw=stanza_raw,
@@ -94,8 +102,8 @@ def validate_params(fieldnames, stanza=None, key=None, app=None,
         stanza_rx=compile_filter("stanza", stanza_raw),
         key_rx=compile_filter("key", key_raw),
         app_rx=compile_filter("app", app) if app is not None else None,
-        audit=bool(audit),
-        debug=bool(debug),
+        audit=audit,
+        debug=debug,
     )
 
 
@@ -108,7 +116,12 @@ def match_sk(group, params):
 def carried(group, app_rx):
     """`carried(G, app_pat)`: at least one definition of the group is carried
     by an app whose name satisfies the pattern - the `system` scope carries no
-    app and never satisfies it."""
+    app and never satisfies it.
+
+    Note (D-19): the OUTPUT field `app` reads `system` on a system-layer row,
+    but `app=` stays a filter on apps, aligned with the `--app` of the btool
+    CLI, where no app is named `system`. `app=system` therefore selects
+    nothing; `scope="system"` is the SPL predicate for that layer."""
     return any(
         definition.scope == "app" and app_rx.match(definition.app)
         for definition in group.defs
