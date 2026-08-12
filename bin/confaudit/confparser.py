@@ -18,6 +18,11 @@ from .model import RawDef
 #: Characters treated as blanks by every strip of this module (section 4.5).
 _BLANKS = " \t"
 
+#: Trailing characters stripped at the END of a LOGICAL value (section 4.5,
+#: extended by D-25 for the multi-line case): the line break is a blank there
+#: too. Only used by `_store`, never mid-value.
+_TRAILING_BLANKS = " \t\n"
+
 
 def decode_conf_bytes(data):
     """Decode a conf file, `utf-8-sig` strict first (section 4.6).
@@ -142,8 +147,17 @@ def _store(stanzas, stanza, key, value, lineno):
     The end of the logical value is stripped of its trailing blanks - btool
     behavior measured on 9.4.6 (lab acceptance, R-1), uniform across mono-line
     values, the last segment of a multi-line value, and a value closed by a
-    `\\` at end of file. `rstrip(" \\t")` stops at the first `\\n`, so the
-    intermediate segments of a multi-line value keep their spaces (M-3d).
+    `\\` at end of file.
+
+    The LINE BREAK counts as a trailing blank (D-25, measured on 9.4.6 over the
+    5 cases of the corpus: 4 in `savedsearches`, 1 in `searchbnf`). A value
+    whose last continued line is empty or blank - `... data \\` followed by a
+    blank line - was terminated by us with `" \\n"` where btool terminates with
+    nothing: `... data`. Section 4.3 of the spec did not treat that case, and
+    the value we emitted was WRONG, not merely unmatched.
+
+    Only the END of the logical value is stripped: the intermediate segments of
+    a multi-line value keep their spaces and their line breaks (M-3d).
     """
     keys = stanzas.setdefault(stanza, {})
-    keys[key] = (value.rstrip(_BLANKS), lineno)
+    keys[key] = (value.rstrip(_TRAILING_BLANKS), lineno)

@@ -229,6 +229,37 @@ definition of the same key and value **and** carries no `(S, key)` definition
 of its own. Such a line is folded back onto its literal origin, which is also
 how the `[default]` verdict is recovered when btool withholds the header.
 
+The same fold covers a second inheritance relation, measured the same way: a
+bare `[<scheme>]` stanza of `inputs.conf` holds the defaults of every
+`[<scheme>://<instance>]` of that scheme. btool **never** prints the bare
+header and expands its keys into each instance, with the path of the file
+declaring the bare stanza. The line is folded back onto `(<scheme>, key)`.
+
+### The btool output is a normalised view, not an echo
+
+`btool --debug` rewrites part of what it reads. Comparing a literal spelling
+with a normalised one manufactures a false `resolver_mismatch` everywhere
+Splunk normalises something, so the command **normalises both sides to
+compare and emits the literal spelling** - the `stanza` and `key` columns
+always carry the source file's own writing. Three normalisations are measured
+on 9.4.6 and applied to the comparison only:
+
+| What btool rewrites | Example | Measured on |
+|---|---|---|
+| `$SPLUNK_HOME` in a stanza name | `[monitor://$SPLUNK_HOME/var/log/splunk]` -> `[monitor:///opt/splunk/var/log/splunk]` | 60 stanzas of `inputs`, 60 explained, 0 left over |
+| a relative scheme path | `[script://./bin/x.py]` -> the absolute path under the declaring app's directory | idem |
+| a doubled backslash in a **key name** | `L-..._\\"\\"_L7(` -> `L-..._\"\"_L7(` | 75 keys of `sourcetypes`, 75 explained; the 21 values of the corpus carrying `\\` are restituted byte for byte |
+
+A fourth measured behaviour concerns the parser rather than the comparison:
+btool emits a definition line **with no path prefix at all** when it cannot
+attach an inherited `[default]` value to any file - it happens for a stanza
+whose input scheme it does not recognise, which gets `host` and `index`
+printed at column 0. Read naively, such a line looks like the continuation of
+a multi-line value and its text gets appended to the previous value. The
+command recognises it by its content: a path-less line reading as
+`<key> = <value>` whose pair is one of the conf's own `[default]` definitions
+has no source file, therefore no origin to report, and is dropped.
+
 ### Safety properties
 
 - **Read-only**: the command writes nothing but its own log file
@@ -284,6 +315,18 @@ verify_ssl = true
   to anything other than `enabled` takes no part in the resolution, which is
   the behavior measured on the validated version of btool. A divergence would
   surface as `resolver_mismatch`.
+- **A bare scheme stanza with no instance gets no btool verdict**: a
+  `[<scheme>]` stanza of `inputs.conf` holds the defaults of the
+  `[<scheme>://<instance>]` stanzas of that scheme. When no instance exists,
+  btool prints **nothing at all** for it - there is no line to expand into,
+  and no header either. The command still reports the definitions (they are in
+  a file, which is what the command is about) but the oracle designates no
+  winner, so each key yields one `resolver_mismatch`. This is a legitimate,
+  named residue - an app shipping `[journald]` without any `[journald://...]`
+  input produces four such rows on the validated version - not a defect of the
+  command. Silencing it would require embedding splunkd's internal table of
+  recognised input types, which is neither observable from btool nor stable
+  across versions.
 - **`parse_error` can entail legitimate `resolver_mismatch`**: on a file with
   a degraded encoding, the command extracts what it can and btool parses the
   file its own way; the two views may differ. Those `resolver_mismatch` rows

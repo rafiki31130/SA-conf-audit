@@ -519,6 +519,181 @@ class MismatchRowTest(unittest.TestCase):
         self.assertEqual(rows[0]["definition_count"], 0)
 
 
+class ConfrontationNormalisationTest(unittest.TestCase):
+    """D-23 to D-26 end to end: `btool --debug` is a NORMALISED view, not an
+    echo of the source. Both sides are normalised to compare; the emission
+    stays literal (D-7). Each shape below is the one measured on Splunk 9.4.6.
+    """
+
+    def test_splunk_home_in_a_stanza_name_is_not_an_anomaly(self):
+        # Class A, 584 of the 784 residual anomalies. btool emits
+        # `[monitor:///opt/splunk/var/log/x]` for the source spelling.
+        fs = FakeFs()
+        path = fs.add(
+            "app", "00_corp_base", "local", "inputs",
+            "[monitor://$SPLUNK_HOME/var/log/x]\ndisabled = 0\n",
+        )
+        btool = FakeBtool({"inputs": build_btool_output([
+            (path, "[monitor:///opt/splunk/var/log/x]"),
+            (path, "disabled = 0"),
+        ])})
+        rows = _run(fs, btool, audit=True, fieldnames=["inputs"])
+        self.assertEqual([row["anomaly"] for row in rows], [""])
+        # The emitted stanza keeps the SOURCE spelling (D-7): normalising for
+        # the comparison must never leak into the output contract.
+        self.assertEqual(rows[0]["stanza"], "monitor://$SPLUNK_HOME/var/log/x")
+        self.assertEqual(rows[0]["is_btool_winner"], "true")
+
+    def test_relative_script_path_is_resolved_against_the_declaring_app(self):
+        # Class A, second form: `[script://./bin/x.py]` declared in an app.
+        fs = FakeFs()
+        path = fs.add(
+            "app", "zz_sample_app", "default", "inputs",
+            "[script://./bin/x.py]\ninterval = 60\n",
+        )
+        btool = FakeBtool({"inputs": build_btool_output([
+            (path, "[script:///opt/splunk/etc/apps/zz_sample_app/bin/x.py]"),
+            (path, "interval = 60"),
+        ])})
+        rows = _run(fs, btool, audit=True, fieldnames=["inputs"])
+        self.assertEqual([row["anomaly"] for row in rows], [""])
+        self.assertEqual(rows[0]["stanza"], "script://./bin/x.py")
+
+    def test_doubled_backslash_in_a_key_name_is_not_an_anomaly(self):
+        # Class D, 150 of the 784: btool collapses `\\` in KEY NAMES only.
+        fs = FakeFs()
+        path = fs.add(
+            "app", "00_corp_base", "local", "sourcetypes",
+            '[rule::probe]\nL-x_\\\\"\\\\"_L7( = 0.324888\n',
+        )
+        btool = FakeBtool({"sourcetypes": build_btool_output([
+            (path, "[rule::probe]"),
+            (path, 'L-x_\\"\\"_L7( = 0.324888'),
+        ])})
+        rows = _run(fs, btool, audit=True, fieldnames=["sourcetypes"])
+        self.assertEqual([row["anomaly"] for row in rows], [""])
+        self.assertEqual(rows[0]["key"], 'L-x_\\\\"\\\\"_L7(')
+        self.assertEqual(rows[0]["is_btool_winner"], "true")
+
+    def test_unattributed_lines_no_longer_corrupt_the_emitted_verdict(self):
+        # Class B, the only one that touched EMITTED data. Measured shape of
+        # `[secure_gateway_modular_input://default]`: `disabled = 0` with a
+        # path, then `host` and `index` with NONE. Read as continuations, they
+        # made `btool_winner_value` carry `0\nhost = ...\nindex = ...` AND
+        # deprived the group of any winner row in the default output.
+        fs = FakeFs()
+        path = fs.add(
+            "app", "zz_sample_app", "local", "inputs",
+            "[default]\nhost = $decideOnStartup\nindex = default\n"
+            "[zz_scheme://default]\ndisabled = 0\n"
+            "[splunktcp]\nroute = has_key:_utf8\n",
+        )
+        btool = FakeBtool({"inputs": build_btool_output([
+            (path, "[splunktcp]"),
+            (path, "host = $decideOnStartup"),
+            (path, "index = default"),
+            (path, "route = has_key:_utf8"),
+            (path, "[zz_scheme://default]"),
+            (path, "disabled = 0\nhost = $decideOnStartup\nindex = default"),
+        ])})
+        rows = _run(fs, btool, audit=True, fieldnames=["inputs"])
+        row = [r for r in rows if r["key"] == "disabled"][0]
+        self.assertEqual(row["anomaly"], "")
+        self.assertEqual(row["value"], "0")
+        self.assertEqual(row["btool_winner_value"], "0")
+        self.assertEqual(row["is_btool_winner"], "true")
+        self.assertEqual([r["anomaly"] for r in rows], ["", "", "", ""])
+        # The two `[default]` keys keep their verdict from the stanza where
+        # btool DID attribute them, and are emitted once, at their origin.
+        self.assertEqual(
+            sorted((r["stanza"], r["key"]) for r in rows),
+            [("default", "host"), ("default", "index"),
+             ("splunktcp", "route"), ("zz_scheme://default", "disabled")],
+        )
+
+    def test_scheme_defaults_are_folded_back_onto_the_bare_stanza(self):
+        # Class C / D-26: `[zz_scheme]` holds the defaults of every
+        # `[zz_scheme://<name>]`; btool never prints its header and expands its
+        # keys into each instance.
+        fs = FakeFs()
+        path = fs.add(
+            "app", "zz_sample_app", "local", "inputs",
+            "[zz_scheme]\ninterval = 77\n[zz_scheme://inst1]\ndisabled = 0\n",
+        )
+        btool = FakeBtool({"inputs": build_btool_output([
+            (path, "[zz_scheme://inst1]"),
+            (path, "disabled = 0"),
+            (path, "interval = 77"),
+        ])})
+        rows = _run(fs, btool, audit=True, fieldnames=["inputs"])
+        self.assertEqual([row["anomaly"] for row in rows], ["", ""])
+        self.assertEqual(
+            sorted((row["stanza"], row["key"]) for row in rows),
+            [("zz_scheme", "interval"), ("zz_scheme://inst1", "disabled")],
+        )
+
+    def test_a_bare_scheme_stanza_without_instance_still_shouts(self):
+        # The measured `journald` case, documented residual of D-26: btool
+        # prints nothing at all, so no verdict exists. The tool must say so,
+        # not invent one.
+        fs = FakeFs()
+        path = fs.add(
+            "app", "zz_sample_app", "default", "inputs",
+            "[zz_lonely]\ninterval = 30\n[splunktcp]\nroute = has_key:_utf8\n",
+        )
+        btool = FakeBtool({"inputs": build_btool_output([
+            (path, "[splunktcp]"), (path, "route = has_key:_utf8"),
+        ])})
+        rows = _run(fs, btool, audit=True, fieldnames=["inputs"])
+        anomalies = [row for row in rows if row["anomaly"] == "resolver_mismatch"]
+        self.assertEqual(len(anomalies), 1)
+        self.assertEqual((anomalies[0]["stanza"], anomalies[0]["key"]),
+                         ("zz_lonely", "interval"))
+
+    def test_the_signal_still_shouts_through_every_normalisation(self):
+        # THE guard test of this increment: the four corrections remove false
+        # positives, they must not muffle `resolver_mismatch`. Same fixture as
+        # the class A and class D cases - normalised stanza, normalised key,
+        # unattributed lines present - but btool designates a value we never
+        # read. One anomaly, and exactly one.
+        fs = FakeFs()
+        path = fs.add(
+            "app", "zz_sample_app", "local", "inputs",
+            "[default]\nhost = $decideOnStartup\n"
+            "[monitor://$SPLUNK_HOME/var/log/x]\ndisabled = 0\n"
+            'k\\\\"z = ours\n'
+            "[splunktcp]\nroute = has_key:_utf8\n",
+        )
+        btool = FakeBtool({"inputs": build_btool_output([
+            (path, "[monitor:///opt/splunk/var/log/x]"),
+            (path, "disabled = 0\nhost = $decideOnStartup"),
+            (path, 'k\\"z = SOMETHING_ELSE'),
+            (path, "[splunktcp]"),
+            (path, "host = $decideOnStartup"),
+            (path, "route = has_key:_utf8"),
+        ])})
+        rows = _run(fs, btool, audit=True, fieldnames=["inputs"])
+        anomalies = [row for row in rows if row["anomaly"] == "resolver_mismatch"]
+        self.assertEqual(len(anomalies), 1)
+        self.assertEqual(anomalies[0]["key"], 'k\\\\"z')
+        self.assertEqual(anomalies[0]["value"], "ours")
+        self.assertEqual(anomalies[0]["btool_winner_value"], "SOMETHING_ELSE")
+        # ...and the two legitimate rows are still clean.
+        self.assertEqual(
+            sorted((row["stanza"], row["key"]) for row in rows
+                   if row["anomaly"] == ""),
+            [("default", "host"),
+             ("monitor://$SPLUNK_HOME/var/log/x", "disabled"),
+             ("monitor://$SPLUNK_HOME/var/log/x", 'k\\\\"z'),
+             ("splunktcp", "route")],
+        )
+        # ...and the definition btool contradicts carries no winner flag: the
+        # oracle designates a value we never read (case 3 of section 6.5).
+        contested = [row for row in rows
+                     if row["key"] == 'k\\\\"z' and row["anomaly"] == ""]
+        self.assertEqual([row["is_btool_winner"] for row in contested], ["false"])
+
+
 class SecretsEndToEndTest(unittest.TestCase):
 
     @staticmethod

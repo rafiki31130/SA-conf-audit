@@ -17,7 +17,7 @@ compares raw values) and BEFORE the emission.
 
 import time
 
-from . import btoolparser, confparser, filters, resolver, volume
+from . import btoolparser, confparser, filters, normalize, resolver, volume
 from .confront import confront
 from .errors import FatalBtoolError, FatalCapabilityError
 from .model import RAW_FIELD, STAR, SYSTEM_APP, AppSettings, output_fields
@@ -189,13 +189,37 @@ def run(fs, btool, rest, fieldnames, stanza=None, key=None, app=None,
             log.error("btool failed on conf=%s (%s)" % (conf, cause))
             raise FatalBtoolError(BTOOL_FAILED_MESSAGE % (conf, cause))
 
+        # Both sides of the confrontation are spelled in BTOOL's namespace
+        # (D-23, D-25): `$SPLUNK_HOME` expanded, relative scheme path resolved,
+        # doubled backslash of a key collapsed. The emission stays literal -
+        # `groups` itself is never rewritten (D-7).
+        splunk_home = normalize.splunk_home_from_etc(etc_prefix)
         literal = {
-            (definition.stanza, definition.key, definition.path, definition.value)
+            (
+                normalize.stanza_for_match(
+                    definition.stanza, splunk_home, definition.path
+                ),
+                normalize.key_for_match(definition.key),
+                definition.path,
+                definition.value,
+            )
             for group in groups.values() for definition in group.defs
         }
-        parsed_output = btoolparser.parse_btool_output(result.stdout, etc_prefix)
+        # `(key, value)` pairs of our `[default]` definitions: what lets the
+        # output parser tell an unattributed definition from a continuation
+        # (D-24). Keys in btool's spelling, values byte for byte.
+        default_pairs = {
+            (key, value) for stanza, key, path, value in literal
+            if stanza == "default"
+        }
+        parsed_output = btoolparser.parse_btool_output(
+            result.stdout, etc_prefix, default_pairs
+        )
         winners = btoolparser.deexpand(parsed_output, literal)
-        verdicts, conf_anomalies = confront(conf, groups, winners)
+        verdicts, conf_anomalies = confront(
+            conf, groups, winners,
+            match_key=lambda group: _match_key(group, splunk_home),
+        )
         anomalies.extend(conf_anomalies)
         selected.extend(
             (group, index, verdicts[(group.stanza, group.key)])
@@ -259,6 +283,22 @@ def run(fs, btool, rest, fieldnames, stanza=None, key=None, app=None,
             emit(row)
         return len(rows)
     return rows
+
+
+def _match_key(group, splunk_home):
+    """The `(stanza, key)` under which a group is looked up among the btool
+    verdicts (D-23, D-25).
+
+    The relative form of a scheme stanza is anchored on the file of the RANK-1
+    definition. A stanza declared under the same relative spelling by two
+    different apps would be two distinct stanzas for btool and a single group
+    for us; not observed on the measured corpus, and resolving it would require
+    splitting a group by app - a contract change, not a normalisation.
+    """
+    return (
+        normalize.stanza_for_match(group.stanza, splunk_home, group.defs[0].path),
+        normalize.key_for_match(group.key),
+    )
 
 
 def _project(row, fields, debug):

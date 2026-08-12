@@ -84,13 +84,13 @@ def _called_names(path):
 
 class LayeringTest(unittest.TestCase):
 
-    def test_the_package_exists_with_its_fourteen_modules(self):
+    def test_the_package_exists_with_its_sixteen_modules(self):
         names = [name for name, _ in _python_files()]
         expected = [
             "__init__.py", "applog.py", "btoolparser.py", "btoolrun.py",
             "confparser.py", "confront.py", "errors.py", "filters.py",
-            "layers.py", "model.py", "pipeline.py", "resolver.py",
-            "rest.py", "secrets.py", "volume.py",
+            "layers.py", "model.py", "normalize.py", "pipeline.py",
+            "resolver.py", "rest.py", "secrets.py", "volume.py",
         ]
         self.assertEqual(names, expected)
 

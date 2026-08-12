@@ -11,11 +11,20 @@ that proof.
 from .model import Anomaly, Verdict
 
 
-def confront(conf, groups, winners):
+def confront(conf, groups, winners, match_key=None):
     """Confront each group with the btool verdicts of its conf.
 
     `groups` maps `(stanza, key)` to `Group`; `winners` maps `(stanza, key)` to
-    `BtoolWinner` (output of `btoolparser.deexpand`).
+    `BtoolWinner` (output of `btoolparser.deexpand`), keyed in BTOOL's
+    namespace.
+
+    `match_key(group)` returns the key under which a group is looked up among
+    the winners - our literal `(stanza, key)` translated into btool's spelling
+    (D-23, D-25: `$SPLUNK_HOME` expanded, relative scheme path resolved,
+    doubled backslash of a key collapsed). It defaults to the identity, which
+    is the right answer whenever nothing is normalised. The emitted `stanza`
+    and `key` stay LITERAL: the translation exists only to make the two sides
+    designate the same object (D-7 untouched).
 
     Returns `(verdicts, anomalies)` where `verdicts` maps every group key to a
     `Verdict` - `index` is the position of the btool-designated definition in
@@ -37,9 +46,12 @@ def confront(conf, groups, winners):
     """
     verdicts = {}
     anomalies = []
+    matched = set()
 
     for group_key, group in groups.items():
-        winner = winners.get(group_key)
+        lookup = group_key if match_key is None else match_key(group)
+        matched.add(lookup)
+        winner = winners.get(lookup)
         if winner is None:
             verdicts[group_key] = Verdict(index=None, winner=None)
             anomalies.append(Anomaly(
@@ -66,7 +78,7 @@ def confront(conf, groups, winners):
         ))
 
     for group_key, winner in winners.items():
-        if group_key not in groups:
+        if group_key not in matched:
             stanza, key = group_key
             anomalies.append(Anomaly(
                 conf=conf, stanza=stanza, key=key,

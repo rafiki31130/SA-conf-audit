@@ -55,6 +55,26 @@ class ContinuationTest(unittest.TestCase):
         self.assertEqual(defs[("s", "key")], "a \nb")
         self.assertEqual(defs[("s", "after")], "ok")
 
+    def test_empty_last_continuation_line_closes_without_a_line_break(self):
+        # D-25, classes E/F: `... data \` followed by a BLANK line. We used to
+        # terminate the value with `" \n"`, btool terminates with nothing.
+        # Measured on 9.4.6, 5 occurrences of the corpus (4 `savedsearches`,
+        # 1 `searchbnf`); the value we emitted was wrong, not merely unmatched.
+        defs = _defs("[s]\nkey = a \\\nb \\\n\nafter = ok\n")
+        self.assertEqual(defs[("s", "key")], "a \nb")
+        self.assertEqual(defs[("s", "after")], "ok")
+
+    def test_blank_last_continuation_line_closes_without_a_line_break(self):
+        # Same rule when the last continued line carries blanks only.
+        defs = _defs("[s]\nkey = a \\\n   \n")
+        self.assertEqual(defs[("s", "key")], "a")
+
+    def test_intermediate_line_breaks_are_never_stripped(self):
+        # Only the END of the logical value is stripped: an inner blank
+        # segment stays, otherwise the fix would eat a real line break.
+        defs = _defs("[s]\nkey = a \\\n\\\nc\n")
+        self.assertEqual(defs[("s", "key")], "a \n\nc")
+
 
 class DefaultStanzaTest(unittest.TestCase):
     """Section 4.2 - keys before the first header belong to `default` (M-3a)."""
