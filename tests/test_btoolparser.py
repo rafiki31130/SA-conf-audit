@@ -147,6 +147,76 @@ class DeexpansionTest(unittest.TestCase):
         self.assertIn(("ref_s3", "case7_key"), winners)
         self.assertEqual(winners[("ref_s3", "case7_key")].path, APP_LOCAL)
 
+    def test_reference_set_comes_from_the_source_files_not_the_btool_stanza(self):
+        # D-21, the `inputs` case measured on 9.4.6: btool EXPANDS the
+        # [default] keys into every stanza but does NOT print the [default]
+        # stanza header. Reading the reference set from the output would leave
+        # it empty and turn every inherited key of every stanza into an
+        # anomaly (803 `resolver_mismatch` on the real conf). Reading it from
+        # our own parsed definitions makes the de-expansion immune to the
+        # missing header.
+        output = build_btool_output([
+            (SYS_DEFAULT, "[stanza_a]"),
+            (SYS_DEFAULT, "index = default"),
+            (SYS_DEFAULT, "own_a = a_val"),
+            (SYS_DEFAULT, "[stanza_b]"),
+            (SYS_DEFAULT, "index = default"),
+            (SYS_DEFAULT, "own_b = b_val"),
+        ])
+        parsed = parse_btool_output(output, ETC)
+        self.assertNotIn("default", parsed.stanzas)  # the header is absent
+        literal = {
+            ("default", "index", SYS_DEFAULT, "default"),
+            ("stanza_a", "own_a", SYS_DEFAULT, "a_val"),
+            ("stanza_b", "own_b", SYS_DEFAULT, "b_val"),
+        }
+        winners = deexpand(parsed, literal)
+        # No repetition survives as a stanza verdict...
+        self.assertNotIn(("stanza_a", "index"), winners)
+        self.assertNotIn(("stanza_b", "index"), winners)
+        # ...and the verdict is folded back onto its literal origin (D-7), so
+        # the `[default]` group keeps a btool verdict despite the missing
+        # header - otherwise the fix would merely move the anomalies.
+        self.assertEqual(winners[("default", "index")].value, "default")
+        self.assertEqual(winners[("default", "index")].path, SYS_DEFAULT)
+        self.assertEqual(winners[("stanza_a", "own_a")].value, "a_val")
+        self.assertEqual(winners[("stanza_b", "own_b")].value, "b_val")
+
+    def test_printed_default_header_stays_authoritative(self):
+        # The `authorize` case: btool DOES print the header. That record is the
+        # verdict of the `[default]` group; the fold must never override it.
+        output = build_btool_output([
+            (APP_LOCAL, "[default]"),
+            (APP_LOCAL, "srchJobsQuota = 3"),
+            (SYS_DEFAULT, "[role_probe]"),
+            (APP_LOCAL, "srchJobsQuota = 3"),
+        ])
+        parsed = parse_btool_output(output, ETC)
+        self.assertIn("default", parsed.stanzas)
+        literal = {("default", "srchJobsQuota", APP_LOCAL, "3")}
+        winners = deexpand(parsed, literal)
+        self.assertNotIn(("role_probe", "srchJobsQuota"), winners)
+        self.assertEqual(winners[("default", "srchJobsQuota")].path, APP_LOCAL)
+        self.assertEqual(winners[("default", "srchJobsQuota")].value, "3")
+
+    def test_a_real_divergence_is_never_swallowed_by_the_fold(self):
+        # The fix removes false positives, it must not remove the signal: a
+        # btool line whose value differs from the `[default]` triplet is not a
+        # repetition, it stays the verdict of its own stanza - which is what
+        # lets the confrontation raise `resolver_mismatch`.
+        output = build_btool_output([
+            (SYS_DEFAULT, "[stanza_a]"),
+            (SYS_DEFAULT, "index = default"),
+            (SYS_DEFAULT, "[stanza_b]"),
+            (APP_LOCAL, "index = overridden"),
+        ])
+        parsed = parse_btool_output(output, ETC)
+        literal = {("default", "index", SYS_DEFAULT, "default")}
+        winners = deexpand(parsed, literal)
+        self.assertNotIn(("stanza_a", "index"), winners)
+        self.assertEqual(winners[("stanza_b", "index")].path, APP_LOCAL)
+        self.assertEqual(winners[("stanza_b", "index")].value, "overridden")
+
     def test_identical_repetition_without_literal_definition_is_discarded(self):
         # Same output as above, but the source files carry NO (ref_s3,
         # case7_key) definition: pure inheritance repetition, discarded.

@@ -442,6 +442,68 @@ class MismatchRowTest(unittest.TestCase):
         self.assertEqual(rows[1]["is_btool_winner"], "true")
         self.assertEqual(rows[0]["is_btool_winner"], "false")
 
+    def test_no_anomaly_when_btool_omits_the_default_header(self):
+        # D-21 end to end, on the shape measured for `inputs`: the source file
+        # carries a `[default]`, btool expands it into every stanza but never
+        # prints the `[default]` header. Before the fix this produced one
+        # `resolver_mismatch` per inherited key per stanza (803 on the real
+        # conf); the sweep must now be silent.
+        fs = FakeFs()
+        path = fs.add(
+            "system", "", "default", "probe",
+            "[default]\nindex = default\nhost = probe-host\n"
+            "[stanza_a]\nown_a = a_val\n[stanza_b]\nown_b = b_val\n",
+        )
+        btool = FakeBtool({"probe": build_btool_output([
+            (path, "[stanza_a]"),
+            (path, "host = probe-host"),
+            (path, "index = default"),
+            (path, "own_a = a_val"),
+            (path, "[stanza_b]"),
+            (path, "host = probe-host"),
+            (path, "index = default"),
+            (path, "own_b = b_val"),
+        ])})
+        rows = _run(fs, btool, audit=True)
+        self.assertEqual([row["anomaly"] for row in rows], ["", "", "", ""])
+        # Origin literality (D-7) is untouched: the two `[default]` keys are
+        # emitted once each, under `stanza=default`.
+        emitted = sorted((row["stanza"], row["key"]) for row in rows)
+        self.assertEqual(emitted, [
+            ("default", "host"), ("default", "index"),
+            ("stanza_a", "own_a"), ("stanza_b", "own_b"),
+        ])
+        self.assertTrue(all(row["is_btool_winner"] == "true" for row in rows))
+
+    def test_a_real_inversion_still_shouts_when_the_default_header_is_absent(self):
+        # Same shape, but btool designates for `[stanza_a]` a value that is
+        # NEITHER the inherited one nor any definition we read: the fix must
+        # remove the false positives without removing the signal.
+        fs = FakeFs()
+        path = fs.add(
+            "system", "", "default", "probe",
+            "[default]\nindex = default\n[stanza_a]\nown_a = a_val\n",
+        )
+        btool = FakeBtool({"probe": build_btool_output([
+            (path, "[stanza_a]"),
+            (path, "index = default"),
+            (path, "own_a = SOMETHING_ELSE"),
+        ])})
+        rows = _run(fs, btool, audit=True)
+        anomalies = [row for row in rows if row["anomaly"] == "resolver_mismatch"]
+        self.assertEqual(len(anomalies), 1)
+        self.assertEqual((anomalies[0]["stanza"], anomalies[0]["key"]),
+                         ("stanza_a", "own_a"))
+        self.assertEqual(anomalies[0]["value"], "a_val")
+        self.assertEqual(anomalies[0]["btool_winner_value"], "SOMETHING_ELSE")
+        # The inherited key is still de-expanded, not turned into a second
+        # anomaly.
+        self.assertEqual(
+            sorted((row["stanza"], row["key"]) for row in rows
+                   if row["anomaly"] == ""),
+            [("default", "index"), ("stanza_a", "own_a")],
+        )
+
     def test_mismatch_rows_are_never_filtered(self):
         fs = FakeFs()
         p1 = fs.add("app", "00_corp_base", "local", "probe", "[s]\nk = v1\n")

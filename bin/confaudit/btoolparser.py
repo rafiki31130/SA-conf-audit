@@ -88,32 +88,65 @@ def deexpand(btool, literal_defs):
 
     btool repeats every `[default]` key in every stanza of the conf, with the
     path of the file CARRYING the `[default]` definition - the path alone does
-    not distinguish an inheritance line from a local definition (M-3b). Rule,
-    per conf (spec section 6.4):
+    not distinguish an inheritance line from a local definition (M-3b).
 
-    1. `D` = set of `(path, key, value)` triplets of the `default` stanza.
-    2. A definition in stanza S != default whose triplet belongs to `D` is an
-       inheritance repetition - discarded - UNLESS our literal definitions
-       contain a `(S, key)` definition with the same path and value: then the
-       btool line restitutes a REAL local redefinition and is kept ("source
-       information" rule, D-11: we read the files, btool only shows its view).
-    3. The remaining records form, per `(stanza, key)` group, the btool
+    The reference set is built from OUR OWN parsed `[default]` definitions, not
+    from the `[default]` stanza of the btool output (D-21). Measured on 9.4.6
+    over 76 conf types: btool prints a `[default]` stanza header whenever a
+    source file declares one - EXCEPT for `inputs`, where the header is
+    suppressed although the inheritance is still expanded into every stanza.
+    The btool header is therefore not a reliable carrier of the `[default]`
+    definitions, while the source files always are. Building `D` from the
+    output made every inherited key of every stanza an anomaly on `inputs`
+    (803 `resolver_mismatch` on a full sweep).
+
+    Rule, per conf (spec section 6.4, D-21):
+
+    1. `D` = `(path, key, value)` triplets of our literal `[default]`
+       definitions - explicit `[default]` header or implicit head-of-file
+       stanza, both parsed as `default` (section 4.2).
+    2. A btool record in stanza S != default whose triplet belongs to `D` is an
+       inheritance repetition, and is FOLDED BACK onto `(default, key)` - the
+       literal origin it was expanded from (D-7) - UNLESS the file at that path
+       carries an `(S, key)` definition of its own, in which case the btool
+       line restitutes a REAL local redefinition and is kept as the verdict of
+       `(S, key)` ("source information" rule: we read the files, btool only
+       shows its view). D-11 stated that rule as an exception; D-21 makes it
+       the foundation.
+    3. The folding never overrides an explicit `[default]` record of the btool
+       output: when btool does print the header, that record is authoritative.
+       The fold only reconstructs the verdict btool withholds when it
+       suppresses the header, from btool's own expanded lines.
+    4. The remaining records form, per `(stanza, key)` group, the btool
        verdict - at most one per group.
 
     `literal_defs` is a set of `(stanza, key, path, value)` tuples built from
     our own parsed definitions (section 4).
     """
-    default_records = btool.stanzas.get("default", {})
     default_triplets = {
-        (record.path, key, record.value)
-        for key, record in default_records.items()
+        (path, key, value)
+        for stanza, key, path, value in literal_defs
+        if stanza == "default"
+    }
+    # `(path, stanza, key)` of every definition we read: tells whether the file
+    # a btool line points at carries an `(S, key)` of its own (D-21, step 2).
+    own_definitions = {
+        (path, stanza, key) for stanza, key, path, value in literal_defs
     }
 
     winners = {}
+    folded = {}
     for stanza, records in btool.stanzas.items():
         for key, record in records.items():
-            if stanza != "default" and (record.path, key, record.value) in default_triplets:
-                if (stanza, key, record.path, record.value) not in literal_defs:
-                    continue  # inheritance repetition, discarded
+            triplet = (record.path, key, record.value)
+            if (stanza != "default" and triplet in default_triplets
+                    and (record.path, stanza, key) not in own_definitions):
+                # Inheritance repetition: its literal origin is the `[default]`
+                # definition of that very file.
+                folded[key] = BtoolWinner(path=record.path, value=record.value)
+                continue
             winners[(stanza, key)] = BtoolWinner(path=record.path, value=record.value)
+
+    for key, winner in folded.items():
+        winners.setdefault(("default", key), winner)
     return winners

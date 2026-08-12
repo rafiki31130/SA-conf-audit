@@ -215,6 +215,20 @@ origin** (`stanza=default`) - never repeated per inheriting stanza the way
 the expanded btool view does. The btool output is de-expanded before the
 confrontation.
 
+The de-expansion takes its reference set from the **source files**, not from
+the `[default]` stanza of the btool output. Measured on 9.4.6 over 76 conf
+types: `btool <conf> list --debug` prints a `[default]` stanza header whenever
+a source file declares one - **except for `inputs`**, where the header is
+suppressed although the inheritance is still expanded into every stanza. A
+de-expansion keyed on the printed header therefore recognises nothing on
+`inputs` and turns every inherited key of every stanza into a
+`resolver_mismatch`. Rule applied instead: a btool line of a stanza
+`S != default`, of triplet `(path, key, value)`, is an inheritance repetition
+if and only if the file at that path carries, in our reading, a `[default]`
+definition of the same key and value **and** carries no `(S, key)` definition
+of its own. Such a line is folded back onto its literal origin, which is also
+how the `[default]` verdict is recovered when btool withholds the header.
+
 ### Safety properties
 
 - **Read-only**: the command writes nothing but its own log file
