@@ -1,5 +1,7 @@
 # SA-conf-audit
 
+[![CI](https://github.com/rafiki31130/SA-conf-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/rafiki31130/SA-conf-audit/actions/workflows/ci.yml)
+
 **btool as a search command.** `| confbtool` audits the file origin of every
 Splunk configuration definition - winners and shadowed alike - in SPL, on the
 member where the search runs.
@@ -87,6 +89,46 @@ Two steps, both local decisions (never shipped by the app):
   inert.
 - **`audit=true` implies `debug=true`**: reading a conflict without the path
   makes no sense, so an explicit `debug=false` is ignored in audit mode.
+
+### `stanza=` and `key=` match the source spelling, not the btool spelling
+
+The `stanza` and `key` columns carry the **literal writing of the source
+file**; `btool --debug` displays a *normalised* one (see [The btool output is a
+normalised view](#the-btool-output-is-a-normalised-view-not-an-echo)). The
+filters compare against the emitted, literal spelling - so a stanza name
+copied from a `btool` CLI session can match nothing. Measured on 9.4.6:
+
+```
+| confbtool inputs stanza="monitor:///opt/splunk/var/log/splunk/editacl.log" audit=true
+  -> 0 definitions          (the spelling btool prints)
+
+| confbtool inputs stanza="monitor://$SPLUNK_HOME/var/log/splunk/editacl.log" audit=true
+  -> 3 definitions          (the spelling the file carries)
+```
+
+Copy-pasting from the CLI is the natural gesture with this tool, and it
+returns an empty result with no message. When a filter comes back empty, run
+the command without it and look at the `stanza` column: what it shows is what
+the filter has to match. The same applies to the relative scheme paths and the
+doubled backslashes of the table further down.
+
+### `anomaly` rows are never filtered
+
+`parse_error` and `resolver_mismatch` rows ignore `stanza=`, `key=`, `app=`
+**and** `audit=` - they are emitted in every mode, whatever the filters. This
+is deliberate: those rows are the command's self-validation channel, and a
+filter must not be able to hide the fact that the tool disagrees with the
+oracle. A consequence to expect:
+
+```
+| confbtool inputs stanza="secure_gateway_modular_input://default" audit=true
+  -> 7 rows: 3 definitions of the requested stanza
+             + 4 [journald] resolver_mismatch rows, unrelated to the filter
+```
+
+Asking for one stanza and receiving rows about another is not a filter bug.
+`| where anomaly=""` restricts to definitions when needed - and the count of
+`| where anomaly!=""` is what you want to watch anyway.
 
 ### The `app=` x `audit=` matrix
 
@@ -273,7 +315,9 @@ has no source file, therefore no origin to report, and is dropped.
   (`*password*`, `*secret*`, `*token*`, `credential*` stanzas, ...) - are
   replaced by `sha256:<hexdigest>` in results. Equal values keep equal
   digests, so cross-layer comparison survives the masking. The log file never
-  carries any configuration value at all.
+  carries any configuration value at all. The complementary patterns, and
+  only they, are switched off on the confs of `pattern_excluded_confs`
+  ([why](#why-some-confs-are-exempt-from-the-key-patterns)).
 - **Robustness**: an unreadable or undecodable file never aborts the run; it
   yields an `anomaly=parse_error` row (never filtered) and the rest of the
   audit is unaffected.
@@ -288,6 +332,8 @@ Ship nothing: the defaults are functional. To override, create
 # Complements encrypt_fields (server.conf), always read at runtime.
 extra_key_patterns = pass4SymmKey, sslPassword, *password*, *secret*, *token*
 extra_stanza_patterns = credential*
+# Confs where the two lists above do not apply. Exact names, no globs.
+pattern_excluded_confs = authorize, collections, fields, multikv, sourcetypes, web-features
 
 [logging]
 # CRITICAL | ERROR | WARNING | INFO | DEBUG
@@ -297,6 +343,41 @@ level = INFO
 # TLS verification of the loopback splunkd calls.
 verify_ssl = true
 ```
+
+### Why some confs are exempt from the key patterns
+
+Substring patterns such as `*token*` match a **name**, and plenty of names
+carry `token` or `password` without the value being a secret. Masking those
+costs readability and protects nothing: `sha256("enabled")` is recovered with
+a one-line dictionary. `pattern_excluded_confs` therefore switches the
+complementary patterns off on confs whose value space cannot hold a
+credential. Measured on a stock 9.4.6 instance, the shipped list accounts for
+50 of the 83 masked values:
+
+| Conf | Masked | Why the value cannot be a secret |
+|---|---|---|
+| `sourcetypes` | 29 | machine-generated file-classifier bundle: the keys are *terms observed in the sampled logs*, the values their frequency (`password = 0.001104`) |
+| `authorize` | 11 | capabilities, roles and quotas; `edit_token_http = enabled` is a switch, and this is the conf an administrator audits first |
+| `multikv` | 4 | closed extraction schema (`<section>.start/.end/.member/.linecount/.tokens`); `.tokens` names a tokenizer (`_tokenize_`), not a credential |
+| `web-features` | 3 | boolean feature flags only |
+| `collections` | 2 | KV-store schema: `field.<name>` declares a *type* (`string`), `accelerated_fields` an index spec |
+| `fields` | 1 | three attributes, all extraction semantics: `TOKENIZER` (a regex), `INDEXED`, `INDEXED_VALUE` |
+
+Two guardrails come with it:
+
+- **`encrypt_fields` is never excluded.** A key the platform declares
+  encryptable stays masked even in a listed conf, so an exclusion cannot
+  unmask a secret the instance itself designates.
+- **Exact names, no globs.** An exclusion must not be able to grow wider than
+  what was demonstrated for it.
+
+The confs left out of the list are left out on purpose. `authentication`,
+`server`, `web` and `app` all carry real credentials - `encrypt_fields` names
+`app:credential:password` and `authentication: :bindDNpassword` explicitly -
+so their policy keys (`minPasswordLength`, `invalidateSessionTokensOnLogout`,
+`reload.passwords`) stay masked rather than open the conf. Over-masking is a
+comfort defect; under-masking is a safety one. Set the list to empty to get
+the pre-1.1.0 behaviour back.
 
 ## Known limits
 
@@ -353,6 +434,30 @@ with a README listing the searches that show each case, and a script that
 deploys and removes it in one gesture. `tools/vendor.sh`
 rebuilds the vendored SDK reproducibly; `tools/verify_vendor.sh` checks it
 against `bin/lib/MANIFEST.sha256`.
+
+### Build pipeline
+
+`.github/workflows/ci.yml` runs on every push and every pull request, in three
+jobs:
+
+| Job | What it does |
+|---|---|
+| `lint` | `ruff check .` (pinned version, config in `ruff.toml`, vendored SDK excluded), then re-reads every `default/*.conf` with the app's own parser - a malformed conf file is invisible to a Python linter and fatal at run time |
+| `test` | `python -m unittest discover -s tests` on Python 3.9 (the interpreter Splunk 9.4 embeds), 3.11 and 3.13, plus `tools/verify_vendor.sh` |
+| `package` | builds the `.spl`, asserts its five roots and the absence of `tests/`, `tools/` and `.github/`, publishes its sha256 in the job summary and uploads it as an artifact |
+
+The packaging step runs **the same `git archive` command as the release
+procedure** on the same tree, so the artifact of a run and the asset of a
+release built from that commit are the same bytes:
+
+```
+git archive --format=tar.gz --prefix=SA-conf-audit/ -o SA-conf-audit-<version>.spl \
+  <commit> -- default bin metadata README.md LICENSE
+```
+
+No secret is used: the workflow only reads the checked-out tree, and the
+`contents: read` permission is all it is granted. Locally, `ruff check .` and
+`python -m unittest discover -s tests` reproduce the two first jobs exactly.
 
 ## License
 
