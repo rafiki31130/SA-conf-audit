@@ -6,7 +6,11 @@ __pycache__/
 htmlcov/
 
 # Per-instance local configuration (secrets patterns, log level, verify_ssl, ...).
-local/
+# ANCHORED to the repository root on purpose: the app's own local/ directory,
+# and that one only. An unanchored `local/` also matches the `local` layer of
+# every fixture tree under tests/, which silently kept three reference-set
+# fixtures out of the repository until the CI ran the suite on a fresh clone.
+/local/
 
 # Logs produced at run time.
 *.log
