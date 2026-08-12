@@ -1,3 +1,8 @@
 []
 access = read : [ admin ], write : [ admin ]
-export = none
+# D-15: global export is REQUIRED. Without it a search command is only
+# invocable from the app context that carries it, which makes `| confbtool`
+# unusable from the Search app - the only real usage. The effective guard has
+# never been visibility but the run-time `run_confbtool` capability check; the
+# per-role read ACL above keeps applying to the exported object.
+export = system
