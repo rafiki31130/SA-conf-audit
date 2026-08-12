@@ -1,0 +1,11 @@
+# Lint configuration, shared by the CI job and local runs (`ruff check .`).
+#
+# The vendored Splunk SDK is excluded: it is stored byte for byte and its
+# digests are pinned in `bin/lib/MANIFEST.sha256`, so it must never be
+# reformatted or "fixed".
+line-length = 100
+exclude = ["bin/lib"]
+target-version = "py37"
+
+[lint]
+select = ["E", "F", "W"]

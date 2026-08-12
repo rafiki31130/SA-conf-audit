@@ -1,0 +1,118 @@
+## Build pipeline of the app: lint, tests, packaging (CDC section 8.2).
+##
+## Three independent jobs; packaging only runs once lint and tests are green.
+## No secret is used or needed: everything runs on the checked-out tree, and
+## the default read-only GITHUB_TOKEN permission is enough.
+##
+## The test job installs nothing: the suite is standard-library only and runs
+## outside Splunk, without network access. Only the linter is fetched, pinned
+## to an exact version so a new release never turns a green branch red on its
+## own.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install the pinned linter
+        run: python -m pip install --disable-pip-version-check ruff==0.6.9
+      - name: ruff check (config in ruff.toml)
+        run: ruff check .
+      - name: The app's own .conf files parse with the app's own parser
+        # A malformed default/*.conf is invisible to a Python linter but breaks
+        # the app at run time, so it is checked with the parser that will read
+        # it.
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          sys.path.insert(0, "bin")
+          from confaudit import confparser
+          for path in sorted(pathlib.Path("default").glob("*.conf")):
+              text, degraded = confparser.decode_conf_bytes(path.read_bytes())
+              if degraded:
+                  sys.exit("degraded encoding: %s" % path)
+              defs = list(confparser.parse_conf_text(text))
+              print("%-24s %3d definitions" % (path, len(defs)))
+              if not defs:
+                  sys.exit("no definition parsed out of %s" % path)
+          PY
+
+  test:
+    name: tests (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the interpreter Splunk 9.4 embeds; the others guard against
+        # relying on anything that a later platform release would drop.
+        python-version: ['3.9', '3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: No non-stdlib dependency is needed
+        run: python -c "import sys; print(sys.version)"
+      - name: Unit tests
+        run: python -m unittest discover -s tests
+      - name: Vendored SDK matches its manifest
+        run: bash tools/verify_vendor.sh python
+
+  package:
+    name: package (.spl)
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the declared version
+        id: version
+        run: |
+          version=$(sed -n 's/^ *version *= *//p' default/app.conf | tr -d ' \r')
+          test -n "$version" || { echo "no [launcher] version in app.conf"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Build the archive
+        # EXACTLY the command of the release procedure, run on the same tree:
+        # the five roots of the deployable contract, explicitly listed, so the
+        # artifact of this job and the asset of a release built from the same
+        # commit are the same bytes.
+        run: |
+          git archive --format=tar.gz --prefix=SA-conf-audit/ \
+            -o "SA-conf-audit-${{ steps.version.outputs.version }}.spl" HEAD \
+            -- default bin metadata README.md LICENSE
+      - name: Check the contents and publish the digest
+        run: |
+          spl="SA-conf-audit-${{ steps.version.outputs.version }}.spl"
+          roots=$(tar -tzf "$spl" | awk -F/ 'NF>1 && $2 != "" {print $2}' | LC_ALL=C sort -u)
+          echo "$roots"
+          expected=$'LICENSE\nREADME.md\nbin\ndefault\nmetadata'
+          test "$roots" = "$expected" || { echo "unexpected roots in the archive"; exit 1; }
+          # Belt and braces: the repository's own service trees must not ship.
+          ! tar -tzf "$spl" | grep -qE '/(tests|tools|\.github)/' || {
+            echo "a service tree leaked into the archive"; exit 1; }
+          {
+            echo "### \`$spl\`"
+            echo
+            echo '```'
+            echo "sha256(archive) $(sha256sum "$spl" | cut -d' ' -f1)"
+            echo "sha256(tar)     $(gzip -dc "$spl" | sha256sum | cut -d' ' -f1)"
+            echo "entries         $(tar -tzf "$spl" | wc -l)"
+            echo "bytes           $(wc -c < "$spl")"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SA-conf-audit-${{ steps.version.outputs.version }}-spl
+          path: SA-conf-audit-${{ steps.version.outputs.version }}.spl
+          if-no-files-found: error
