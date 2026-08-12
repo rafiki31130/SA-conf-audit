@@ -192,12 +192,21 @@ UTF-8.
 ```
 
 Three rows: one `anomaly=parse_error` naming the file, plus the definitions
-the parser could still extract (the resolution is never amputated). The rest
-of an audit that includes this conf is unaffected:
+the parser could still extract (the resolution is never amputated). The run
+carries on, and an audit spanning this conf is not aborted by it.
+
+The same file also yields one `resolver_mismatch`: the command extracts what
+it can from the broken bytes while btool parses them its own way, so the two
+views legitimately differ. That row is a signal about the file, not a defect.
 
 ```
 | confbtool * | where anomaly!=""
 ```
+
+is the self-validation sweep. Read it per conf (`| stats count by conf
+anomaly`) rather than as a single number: a `resolver_mismatch` always means
+"our ranking and btool disagree here", which is worth looking at whatever its
+cause.
 
 ### K - the system layer is named, not blank
 
