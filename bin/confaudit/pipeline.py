@@ -82,6 +82,7 @@ def load_settings(default_data, local_data):
     defaults = AppSettings()
     key_patterns = values.get(("secrets", "extra_key_patterns"))
     stanza_patterns = values.get(("secrets", "extra_stanza_patterns"))
+    excluded_confs = values.get(("secrets", "pattern_excluded_confs"))
     level = values.get(("logging", "level"))
     verify = values.get(("rest", "verify_ssl"))
     return AppSettings(
@@ -92,6 +93,10 @@ def load_settings(default_data, local_data):
         extra_stanza_patterns=(
             parse_pattern_list(stanza_patterns) if stanza_patterns is not None
             else defaults.extra_stanza_patterns
+        ),
+        pattern_excluded_confs=(
+            parse_pattern_list(excluded_confs) if excluded_confs is not None
+            else defaults.pattern_excluded_confs
         ),
         log_level=(level or defaults.log_level).strip(),
         verify_ssl=(

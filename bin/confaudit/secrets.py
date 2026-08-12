@@ -5,7 +5,11 @@ Two sources, both read at execution time:
 1. `encrypt_fields` (`server.conf`) - the canonical list maintained by Splunk
    itself (M-5), obtained through the library's own layer resolution;
 2. complementary configurable glob patterns (`confbtool.conf` `[secrets]`),
-   covering sensitive keys the platform does not encrypt.
+   covering sensitive keys the platform does not encrypt. They are switched
+   off on a configurable list of confs (`pattern_excluded_confs`, D-29) whose
+   value space cannot hold a credential - `authorize` and the like, where the
+   patterns only match capability or feature-flag names. Source 1 is never
+   excluded.
 
 The hashed value is the value as restituted by the file layer - the `$7$...`
 encrypted form when Splunk encrypted it (btool never emits a cleartext, M-5) -
@@ -103,6 +107,11 @@ class SecretMatcher:
     included; a non-empty one compares strictly) OR a complementary pattern
     matches (key globs case-INsensitive; stanza globs mark every key of a
     matching stanza as sensitive).
+
+    The complementary patterns - and only they - are switched off on the confs
+    of `pattern_excluded_confs` (D-29, CDC section 6.2). The `encrypt_fields`
+    rules keep applying everywhere: they are precise by construction, so
+    nothing they designate is ever unmasked by an exclusion.
     """
 
     def __init__(self, rules=(), settings=None):
@@ -116,12 +125,15 @@ class SecretMatcher:
             _compile_glob(p, ignore_case=False)
             for p in settings.extra_stanza_patterns
         )
+        self._excluded_confs = frozenset(settings.pattern_excluded_confs)
 
     def is_sensitive(self, conf, stanza, key):
         for rule in self._rules:
             if rule.conf == conf and rule.key == key:
                 if rule.stanza == "" or rule.stanza == stanza:
                     return True
+        if conf in self._excluded_confs:
+            return False
         for pattern in self._key_rx:
             if pattern.match(key):
                 return True

@@ -1,7 +1,6 @@
 """Secret rules and hashing (spec section 9)."""
 
 import hashlib
-import re
 import unittest
 
 import tests  # noqa: F401  - inserts bin/ into sys.path before confaudit imports
@@ -84,6 +83,87 @@ class SecretMatcherTest(unittest.TestCase):
     def test_pattern_list_parsing(self):
         self.assertEqual(
             parse_pattern_list(" a , *b* ,, c "), ("a", "*b*", "c")
+        )
+
+
+class PatternExcludedConfsTest(unittest.TestCase):
+    """D-29 / CDC section 6.2 - the complementary patterns, and only they, are
+    switched off on the excluded confs."""
+
+    def setUp(self):
+        self.matcher = SecretMatcher(
+            rules=parse_encrypt_fields(ENCRYPT_FIELDS),
+            settings=AppSettings(),
+        )
+
+    def test_authorize_is_excluded_by_default(self):
+        # The eleven capability names of the A-1 measurement: their value is
+        # `enabled`, hashing them protects nothing and hides the conf every
+        # administrator audits first.
+        for key in (
+            "edit_splunktcp_token", "edit_storage_passwords", "edit_token_http",
+            "edit_tokens_all", "edit_tokens_own", "edit_tokens_settings",
+            "list_storage_passwords", "list_token_http", "list_tokens_all",
+            "list_tokens_own", "change_own_password",
+        ):
+            self.assertFalse(
+                self.matcher.is_sensitive("authorize", "role_admin", key), key
+            )
+
+    def test_other_default_exclusions(self):
+        # One measured key per conf of the shipped default list.
+        for conf, stanza, key in (
+            ("sourcetypes", "../scripts/logs/apache.error.log", "password"),
+            ("multikv", "PerfmonMk", "body.tokens"),
+            ("web-features", "feature:page_migration",
+             "enable_password_management_page_vnext"),
+            ("collections", "delete_tokens", "field.token_id"),
+            ("fields", "default", "TOKENIZER"),
+        ):
+            self.assertFalse(self.matcher.is_sensitive(conf, stanza, key),
+                             "%s/%s" % (conf, key))
+
+    def test_a_conf_that_is_not_excluded_is_still_hashed(self):
+        # authentication.conf carries LDAP/SAML credentials by design, so it
+        # is deliberately NOT excluded: its policy keys stay hashed rather
+        # than risk unmasking a neighbouring secret.
+        for key in ("minPasswordLength", "expirePasswordDays",
+                    "passwordHashAlgorithm"):
+            self.assertTrue(
+                self.matcher.is_sensitive("authentication", "splunk_auth", key)
+            )
+        # And so does every conf outside the list.
+        self.assertTrue(self.matcher.is_sensitive("web", "settings",
+                                                  "loginPasswordHint"))
+        self.assertTrue(self.matcher.is_sensitive("limits", "http_input",
+                                                  "max_number_of_tokens"))
+
+    def test_encrypt_fields_is_never_excluded(self):
+        # Even on an excluded conf, an encrypt_fields entry keeps hashing.
+        matcher = SecretMatcher(
+            rules=parse_encrypt_fields('"authorize: :bindDNpassword"'),
+            settings=AppSettings(),
+        )
+        self.assertFalse(matcher.is_sensitive("authorize", "role_admin",
+                                              "edit_token_http"))
+        self.assertTrue(matcher.is_sensitive("authorize", "role_admin",
+                                             "bindDNpassword"))
+
+    def test_exclusion_list_is_configurable_and_exact(self):
+        settings = AppSettings(pattern_excluded_confs=("probe",))
+        matcher = SecretMatcher(rules=(), settings=settings)
+        self.assertFalse(matcher.is_sensitive("probe", "s", "api_token"))
+        # Not excluded any more: the shipped default is fully overridden.
+        self.assertTrue(matcher.is_sensitive("authorize", "s", "edit_token_http"))
+        # Exact names only - no glob semantics, so `probe*` never widens.
+        self.assertTrue(matcher.is_sensitive("probe_other", "s", "api_token"))
+
+    def test_empty_exclusion_list_restores_the_pre_d29_behaviour(self):
+        matcher = SecretMatcher(
+            rules=(), settings=AppSettings(pattern_excluded_confs=()),
+        )
+        self.assertTrue(
+            matcher.is_sensitive("authorize", "role_admin", "edit_token_http")
         )
 
 

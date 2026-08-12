@@ -1,6 +1,6 @@
 """Immutable data structures - no logic here (spec section 3.2)."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Pattern, Tuple
 
 #: Sentinel for the `*` conf argument: every conf present on disk.
@@ -218,6 +218,16 @@ class AppSettings:
         "pass4SymmKey", "sslPassword", "*password*", "*secret*", "*token*",
     )
     extra_stanza_patterns: Tuple[str, ...] = ("credential*",)
+    # Confs where the two complementary pattern lists above do NOT apply
+    # (D-29). Exact conf names, case-sensitive - never globs: an exclusion
+    # must not be able to grow wider than what was demonstrated. The
+    # `encrypt_fields` list is never excluded. Each default name is a conf
+    # whose value space cannot hold a credential by construction; the
+    # justification is in the README.
+    pattern_excluded_confs: Tuple[str, ...] = (
+        "authorize", "collections", "fields", "multikv", "sourcetypes",
+        "web-features",
+    )
     log_level: str = "INFO"
     verify_ssl: bool = True
 

@@ -17,7 +17,6 @@ from confaudit.errors import FatalBtoolError, FatalCapabilityError, FatalUsageEr
 from confaudit.model import BtoolResult
 from confaudit.secrets import hash_value
 from tests.helpers import (
-    CollectingLog,
     FakeBtool,
     FakeFs,
     FakeRest,
@@ -703,8 +702,8 @@ class SecretsEndToEndTest(unittest.TestCase):
                '[general]\nencrypt_fields = "probe:s:hidden_key"\n')
         p_sys = fs.add("system", "", "local", "probe",
                        "[s]\nhidden_key = $7$sys_cipher\n")
-        p_app = fs.add("app", "00_corp_base", "local", "probe",
-                       "[s]\nhidden_key = $7$app_cipher\n")
+        fs.add("app", "00_corp_base", "local", "probe",
+               "[s]\nhidden_key = $7$app_cipher\n")
         btool = FakeBtool({"probe": build_btool_output([
             (p_sys, "[s]"), (p_sys, "hidden_key = $7$sys_cipher"),
         ])})
@@ -737,6 +736,54 @@ class SecretsEndToEndTest(unittest.TestCase):
         ])})
         rows = _run(fs, btool)
         self.assertEqual(rows[0]["value"], hash_value("cleartext"))
+
+    @staticmethod
+    def _excluded_conf_fixture(conf):
+        """One capability-shaped definition, in `conf`, matching *token*."""
+        fs = FakeFs()
+        fs.add("system", "", "local", "server",
+               '[general]\nencrypt_fields = "server: :pass4SymmKey"\n')
+        path = fs.add("system", "", "default", conf,
+                      "[role_admin]\nedit_token_http = enabled\n")
+        btool = FakeBtool({conf: build_btool_output([
+            (path, "[role_admin]"), (path, "edit_token_http = enabled"),
+        ])})
+        return fs, btool
+
+    def test_excluded_conf_emits_the_value_in_clear(self):
+        # D-29 / A-1: `| confbtool authorize` must read as the conf itself.
+        fs, btool = self._excluded_conf_fixture("authorize")
+        rows = _run(fs, btool, fieldnames=["authorize"])
+        self.assertEqual(rows[0]["value"], "enabled")
+        self.assertNotIn("sha256:", repr(rows))
+
+    def test_same_key_in_a_non_excluded_conf_is_still_hashed(self):
+        fs, btool = self._excluded_conf_fixture("notexcluded")
+        rows = _run(fs, btool, fieldnames=["notexcluded"])
+        self.assertEqual(rows[0]["value"], hash_value("enabled"))
+
+
+class LoadSettingsTest(unittest.TestCase):
+    """`confbtool.conf` -> AppSettings (spec section 2.2)."""
+
+    def test_defaults_when_no_file(self):
+        settings = pipeline.load_settings(None, None)
+        self.assertIn("authorize", settings.pattern_excluded_confs)
+        self.assertIn("*password*", settings.extra_key_patterns)
+
+    def test_local_layer_overrides_the_exclusion_list(self):
+        default = b"[secrets]\npattern_excluded_confs = authorize, fields\n"
+        local = b"[secrets]\npattern_excluded_confs = authorize\n"
+        self.assertEqual(
+            pipeline.load_settings(default, local).pattern_excluded_confs,
+            ("authorize",),
+        )
+
+    def test_empty_value_disables_every_exclusion(self):
+        default = b"[secrets]\npattern_excluded_confs =\n"
+        self.assertEqual(
+            pipeline.load_settings(default, None).pattern_excluded_confs, ()
+        )
 
 
 class OrderingAndPruningTest(unittest.TestCase):
