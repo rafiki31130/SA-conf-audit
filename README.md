@@ -112,23 +112,33 @@ the command without it and look at the `stanza` column: what it shows is what
 the filter has to match. The same applies to the relative scheme paths and the
 doubled backslashes of the table further down.
 
-### `anomaly` rows are never filtered
+### `anomaly` rows are scoped by the filters, each by what it knows
 
-`parse_error` and `resolver_mismatch` rows ignore `stanza=`, `key=`, `app=`
-**and** `audit=` - they are emitted in every mode, whatever the filters. This
-is deliberate: those rows are the command's self-validation channel, and a
-filter must not be able to hide the fact that the tool disagrees with the
-oracle. A consequence to expect:
+Anomaly rows are the command's self-validation channel: a filter must not be
+able to hide the fact that the tool disagrees with the oracle **about what you
+asked for**. That guarantee is scoped, not global - each kind of row is scoped
+by what it actually knows:
+
+| Row | Scoped by |
+|---|---|
+| `resolver_mismatch` | like a definition: `<conf>`, `stanza=`, `key=` and `app=`. It carries a known `(conf, stanza, key)`, so its perimeter is determinable. `app=` is evaluated on the group, so an anomaly on a key the app takes part in surfaces even in the default mode, where that group may emit no row at all |
+| `parse_error` | **conf only**. The file could not be read, so which stanzas and keys it carried is unknown - silencing it inside its own conf would answer "nothing here" without knowing. `stanza=`, `key=` and `app=` never exclude it |
+
+Neither is affected by `audit=`: both are emitted in every mode.
+
+Inside the perimeter you asked for, an anomaly is unmaskable. Outside it, it no
+longer pollutes an answer it does not concern:
 
 ```
-| confbtool inputs stanza="secure_gateway_modular_input://default" audit=true
-  -> 7 rows: 3 definitions of the requested stanza
-             + 4 [journald] resolver_mismatch rows, unrelated to the filter
+| confbtool inputs app=splunk_secure_gateway audit=f
+             stanza="ssg_kvstore_upgrade://default"
+  -> 1 row: the definition asked for.
+     The 4 [journald] resolver_mismatch rows of another app are out of scope.
+     They still show up in | confbtool inputs, and in | confbtool *.
 ```
 
-Asking for one stanza and receiving rows about another is not a filter bug.
 `| where anomaly=""` restricts to definitions when needed - and the count of
-`| where anomaly!=""` is what you want to watch anyway.
+`| where anomaly!=""` on an unfiltered scan is what you want to watch anyway.
 
 ### The `app=` x `audit=` matrix
 
@@ -321,8 +331,8 @@ has no source file, therefore no origin to report, and is dropped.
   only they, are switched off on the confs of `pattern_excluded_confs`
   ([why](#why-some-confs-are-exempt-from-the-key-patterns)).
 - **Robustness**: an unreadable or undecodable file never aborts the run; it
-  yields an `anomaly=parse_error` row (never filtered) and the rest of the
-  audit is unaffected.
+  yields an `anomaly=parse_error` row - scoped by conf, never excluded by
+  `stanza=`, `key=` or `app=` - and the rest of the audit is unaffected.
 
 ## Configuration (`confbtool.conf`)
 

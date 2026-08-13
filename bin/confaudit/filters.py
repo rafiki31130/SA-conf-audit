@@ -7,8 +7,10 @@ CDC section 5.2 / C-11), so `precedence_rank`, `is_btool_winner` and
 `definition_count` stay right whatever the filters.
 """
 
+import os
 import re
 
+from . import normalize
 from .errors import FatalUsageError
 from .model import Params, STAR
 
@@ -126,6 +128,69 @@ def carried(group, app_rx):
         definition.scope == "app" and app_rx.match(definition.app)
         for definition in group.defs
     )
+
+
+def _app_of_path(path):
+    """App name carrying a layer file, or `None` for a system-layer file."""
+    root = normalize.app_root(path) if path else None
+    return os.path.basename(root.rstrip("/")) if root else None
+
+
+def select_anomalies(anomalies, groups, params):
+    """D-35: scope the `resolver_mismatch` lines of ONE conf to the filters.
+
+    A `resolver_mismatch` carries a KNOWN `(conf, stanza, key)`, so its
+    perimeter is determinable and it is scoped like a definition: emitted only
+    if the triplet satisfies `<conf>` (already true - anomalies are collected
+    per conf), `stanza=`, `key=` and `app=`.
+
+    `app=` is evaluated at GROUP granularity (`carried`), in both modes: the
+    anomaly is a statement about the group, not about one of its definitions,
+    and in `audit=false` the group may well have no emitted definition at all -
+    that is precisely when the user must still be told the resolver disagreed
+    about a key the app takes part in. This is the loosest scoping that stays
+    inside the requested perimeter, and it is what keeps an in-scope anomaly
+    UNMASKABLE (D-35, CDC section 5.4).
+
+    Two degenerate shapes are handled explicitly:
+
+    - no group at all (btool designates a `(stanza, key)` we never built): the
+      app is read off the paths the anomaly does carry;
+    - no determinable app on any known path: the anomaly is EMITTED. Never drop
+      what cannot be scoped - dropping it would be exactly the silent wrong
+      answer the rule exists to prevent.
+
+    `parse_error` lines are NOT handled here: they are scoped by conf alone,
+    which the per-conf collection already does. The file could not be read, so
+    which stanzas and keys it carried is unknown, and silencing it inside its
+    own conf would answer "nothing here" without knowing (D-35).
+    """
+    out = []
+    for anomaly in anomalies:
+        if not params.stanza_rx.match(anomaly.stanza):
+            continue
+        if not params.key_rx.match(anomaly.key):
+            continue
+        if params.app_rx is not None and not _anomaly_in_app(
+                anomaly, groups, params.app_rx):
+            continue
+        out.append(anomaly)
+    return out
+
+
+def _anomaly_in_app(anomaly, groups, app_rx):
+    group = groups.get((anomaly.stanza, anomaly.key))
+    if group is not None:
+        return carried(group, app_rx)
+    paths = [
+        side.path for side in (anomaly.internal, anomaly.btool)
+        if side is not None and getattr(side, "path", None)
+    ]
+    apps = [_app_of_path(path) for path in paths]
+    named = [app for app in apps if app]
+    if not named:
+        return True     # not scopable: emit rather than silently drop
+    return any(app_rx.match(app) for app in named)
 
 
 def select(groups, verdicts, params):

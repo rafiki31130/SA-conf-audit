@@ -225,22 +225,31 @@ def run(fs, btool, rest, fieldnames, stanza=None, key=None, app=None,
             conf, groups, winners,
             match_key=lambda group: _match_key(group, splunk_home),
         )
-        anomalies.extend(conf_anomalies)
+        # D-35: a `resolver_mismatch` carries a known (conf, stanza, key), so
+        # it is scoped like a definition. A `parse_error` is not: it is scoped
+        # by conf alone, which this per-conf loop already does.
+        kept_anomalies = filters.select_anomalies(
+            conf_anomalies, groups, params
+        )
+        anomalies.extend(kept_anomalies)
         selected.extend(
             (group, index, verdicts[(group.stanza, group.key)])
             for group, index in filters.select(groups, verdicts, params)
         )
         log.info(
-            "conf=%s files=%d defs=%d groups=%d btool_ms=%d anomalies=%d" % (
+            "conf=%s files=%d defs=%d groups=%d btool_ms=%d "
+            "anomalies=%d/%d (kept/found)" % (
                 conf, len(parsed) + len(failed),
                 sum(len(group.defs) for group in groups.values()),
-                len(groups), btool_ms, len(conf_anomalies),
+                len(groups), btool_ms,
+                len(kept_anomalies), len(conf_anomalies),
             )
         )
 
-    # 7. Volume guard (D-8): count what WOULD be emitted - definitions plus
-    # `parse_error` and `resolver_mismatch` lines, which are never filtered -
-    # BEFORE building or emitting a single row.
+    # 7. Volume guard (D-8): count what WOULD be emitted - the selected
+    # definitions plus the anomaly lines the filters kept (D-35: a
+    # `resolver_mismatch` is scoped like a definition, a `parse_error` by conf)
+    # - BEFORE building or emitting a single row.
     row_count = len(selected) + len(parse_errors) + len(anomalies)
     try:
         volume.check(row_count, limit)

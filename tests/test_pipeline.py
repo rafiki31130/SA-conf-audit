@@ -3,10 +3,10 @@
 Covers: capability gate (exact message), btool failure (exact message, D-13),
 row shape and emission order, the CONDITIONAL field set of D-17/D-18 (asserted
 on the keys present, never on their content), the absence of ANY event field -
-neither `_raw` nor `_time` (D-34, which cancels D-16), `app=system` (D-19), `parse_error`
-never filtered, rank/count insensitive to filters, secrets end-to-end (`value`
-AND `btool_winner_value` hashed, no raw sensitive value in any row), upstream
-pruning, member field.
+neither `_raw` nor `_time` (D-34, which cancels D-16), `app=system` (D-19), the
+filter scoping of anomaly rows (D-35), rank/count insensitive to filters,
+secrets end-to-end (`value` AND `btool_winner_value` hashed, no raw sensitive
+value in any row), upstream pruning, member field.
 """
 
 import unittest
@@ -578,19 +578,132 @@ class MismatchRowTest(unittest.TestCase):
             [("default", "index"), ("stanza_a", "own_a")],
         )
 
-    def test_mismatch_rows_are_never_filtered(self):
+class AnomalyScopingTest(unittest.TestCase):
+    """D-35: anomaly rows are SCOPED BY THE FILTERS, each according to what it
+    knows. Replaces the "anomaly rows are never filtered" rule of D-32.
+
+    - `resolver_mismatch` carries a known `(conf, stanza, key)`: scoped like a
+      definition, by `<conf>`, `stanza=`, `key=` and `app=`.
+    - `parse_error` is scoped by CONF ONLY: the file could not be read, so
+      which stanzas and keys it carried is unknown.
+
+    The guarantee kept: INSIDE the requested perimeter an anomaly stays
+    unmaskable. Outside it, it no longer pollutes an answer it does not
+    concern.
+    """
+
+    def _ghost_fixture(self):
+        """One definition `[s] k`, plus a `[zz_ghost] ghost_key` that btool
+        designates and we never built - a groupless `resolver_mismatch`."""
         fs = FakeFs()
-        p1 = fs.add("app", "00_corp_base", "local", "probe", "[s]\nk = v1\n")
+        path = fs.add("app", "00_corp_base", "local", "probe",
+                      "[s]\nk = v1\n")
         btool = FakeBtool({"probe": build_btool_output([
-            (p1, "[s]"), (p1, "k = v1"),
-            (p1, "[zz_ghost]"), (p1, "ghost_key = ghost_val"),
+            (path, "[s]"), (path, "k = v1"),
+            (path, "[zz_ghost]"), (path, "ghost_key = ghost_val"),
         ])})
+        return fs, btool
+
+    def _shouting_group_fixture(self):
+        """A group carried by `00_corp_base` on which btool designates a value
+        we never read - a `resolver_mismatch` WITH a group."""
+        fs = FakeFs()
+        path = fs.add("app", "00_corp_base", "local", "probe",
+                      "[s]\nk = v1\n")
+        other = fs.add("app", "zz_other_app", "local", "probe",
+                       "[t]\nother = o\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (path, "[s]"), (path, "k = SOMETHING_ELSE"),
+            (other, "[t]"), (other, "other = o"),
+        ])})
+        return fs, btool
+
+    # -- resolver_mismatch: scoped like a definition --------------------- #
+
+    def test_an_out_of_scope_mismatch_is_not_emitted(self):
+        fs, btool = self._ghost_fixture()
         rows = _run(fs, btool, stanza="no_match")
+        self.assertEqual(rows, [])
+
+    def test_an_in_scope_mismatch_is_still_emitted(self):
+        fs, btool = self._ghost_fixture()
+        rows = _run(fs, btool, stanza="zz_ghost")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["anomaly"], "resolver_mismatch")
         self.assertEqual((rows[0]["stanza"], rows[0]["key"]),
                          ("zz_ghost", "ghost_key"))
         self.assertEqual(rows[0]["definition_count"], 0)
+
+    def test_a_key_filter_scopes_a_mismatch_both_ways(self):
+        fs, btool = self._ghost_fixture()
+        self.assertEqual(_run(fs, btool, key="no_match"), [])
+        rows = _run(fs, btool, key="ghost_*")
+        self.assertEqual([row["anomaly"] for row in rows],
+                         ["resolver_mismatch"])
+
+    def test_app_filter_scopes_a_mismatch_by_the_apps_of_its_group(self):
+        # `app=` is evaluated at GROUP granularity: the anomaly is a statement
+        # about the group, and in audit=false the group may have no emitted
+        # definition at all - which is exactly when the user must be told.
+        fs, btool = self._shouting_group_fixture()
+        rows = _run(fs, btool, app="00_corp_base")
+        kinds = [row["anomaly"] for row in rows]
+        self.assertIn("resolver_mismatch", kinds)
+        rows = _run(fs, btool, app="zz_other_app")
+        self.assertNotIn("resolver_mismatch",
+                         [row["anomaly"] for row in rows])
+
+    def test_a_groupless_mismatch_is_scoped_by_the_app_of_its_btool_path(self):
+        fs, btool = self._ghost_fixture()
+        rows = _run(fs, btool, stanza="zz_ghost", app="00_corp_base")
+        self.assertEqual([row["anomaly"] for row in rows],
+                         ["resolver_mismatch"])
+        self.assertEqual(_run(fs, btool, stanza="zz_ghost",
+                              app="zz_absent_app"), [])
+
+    def test_the_scan_still_shows_every_mismatch(self):
+        # Scoping must not make an anomaly vanish from a search that COVERS it.
+        fs, btool = self._ghost_fixture()
+        rows = _run(fs, btool)
+        self.assertEqual(
+            sorted(row["anomaly"] for row in rows), ["", "resolver_mismatch"]
+        )
+
+    # -- parse_error: scoped by conf only -------------------------------- #
+
+    def _parse_error_fixture(self):
+        fs = FakeFs()
+        bad = fs.add("app", "00_corp_base", "local", "probe", "[s]\nk = v\n")
+        fs.unreadable.add(bad)
+        ok = fs.add("app", "zz_sample_app", "local", "probe",
+                    "[s]\nk = zz\n")
+        other = fs.add("app", "00_corp_base", "local", "elsewhere",
+                       "[e]\nek = ev\n")
+        fs.unreadable.add(other)
+        btool = FakeBtool({
+            "probe": build_btool_output([(ok, "[s]"), (ok, "k = zz")]),
+            "elsewhere": "",
+        })
+        return fs, btool, bad
+
+    def test_a_parse_error_of_another_conf_is_not_emitted(self):
+        fs, btool, bad = self._parse_error_fixture()
+        rows = _run(fs, btool, fieldnames=["probe"])
+        errors = [row for row in rows if row["anomaly"] == "parse_error"]
+        self.assertEqual([row["conf"] for row in errors], ["probe"])
+
+    def test_a_parse_error_survives_a_stanza_filter_that_cannot_match_it(self):
+        # The file was unreadable: which stanzas it carried is UNKNOWN, so a
+        # `stanza=` can never legitimately exclude it. Silencing it inside its
+        # own conf would answer "nothing here" without knowing.
+        fs, btool, bad = self._parse_error_fixture()
+        for kwargs in ({"stanza": "no_match"}, {"key": "no_match"},
+                       {"app": "zz_sample_app"},
+                       {"stanza": "no_match", "audit": True}):
+            rows = _run(fs, btool, fieldnames=["probe"], **kwargs)
+            errors = [row for row in rows if row["anomaly"] == "parse_error"]
+            self.assertEqual(len(errors), 1, kwargs)
+            self.assertEqual(errors[0]["conf"], "probe", kwargs)
 
 
 class ConfrontationNormalisationTest(unittest.TestCase):
