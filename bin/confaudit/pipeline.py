@@ -20,7 +20,7 @@ import time
 from . import btoolparser, confparser, filters, normalize, resolver, volume
 from .confront import confront
 from .errors import FatalBtoolError, FatalCapabilityError
-from .model import STAR, SYSTEM_APP, AppSettings, output_fields
+from .model import STAR, AppSettings, emitted_app, output_fields
 from .secrets import (
     SecretMatcher,
     parse_encrypt_fields,
@@ -267,23 +267,26 @@ def run(fs, btool, rest, fieldnames, stanza=None, key=None, app=None,
     # silently blanks whatever a later record adds - a heterogeneous row set
     # would produce results depending on the emission order.
     fields = output_fields(params.audit, params.debug)
-    rows = []
+    built = []
     for conf, layer_file in parse_errors:
-        rows.append(_project(_parse_error_row(conf, layer_file, member), fields))
+        built.append(_parse_error_row(conf, layer_file, member))
     for group, index, verdict in selected:
-        rows.append(
-            _project(
-                _definition_row(group, index, verdict, member, matcher), fields
-            )
-        )
+        built.append(_definition_row(group, index, verdict, member, matcher))
     for anomaly in anomalies:
-        rows.append(_project(_mismatch_row(anomaly, member, matcher), fields))
+        built.append(_mismatch_row(anomaly, member, matcher))
 
     # 9. Emission order (spec section 3.2): conf, stanza, key,
     # precedence_rank, code-point string comparisons. `parse_error` rows
     # (empty stanza/key) land at the head of their conf; a `resolver_mismatch`
     # row (empty rank) lands after the ranked rows of its group.
-    rows.sort(key=_sort_key)
+    #
+    # The sort runs on the FULL rows, BEFORE the projection: since D-37 the
+    # default mode does not emit `precedence_rank`, so sorting projected rows
+    # would look for a key that is no longer there. The emission ORDER of the
+    # rows and the column order of the record are two different contracts; only
+    # the second one is mode-dependent.
+    built.sort(key=_sort_key)
+    rows = [_project(row, fields) for row in built]
     log.info("emitting %d rows" % len(rows))
 
     if emit is not None:
@@ -425,7 +428,7 @@ def _definition_row(group, index, verdict, member, matcher):
         "key": group.key,
         "value": hash_value(definition.value) if sensitive else definition.value,
         "scope": definition.scope,
-        "app": definition.app or SYSTEM_APP,
+        "app": emitted_app(definition.app),
         "layer": definition.layer,
         "precedence_rank": index + 1,
         "is_btool_winner": "true" if verdict.index == index else "false",
@@ -451,7 +454,7 @@ def _parse_error_row(conf, layer_file, member):
         "key": "",
         "value": "",
         "scope": layer_file.scope,
-        "app": layer_file.app or SYSTEM_APP,
+        "app": emitted_app(layer_file.app),
         "layer": layer_file.layer,
         "precedence_rank": "",
         "is_btool_winner": "",
@@ -480,7 +483,7 @@ def _mismatch_row(anomaly, member, matcher):
         "key": anomaly.key,
         "value": hash_value(value) if sensitive and internal is not None else value,
         "scope": internal.scope if internal is not None else "",
-        "app": (internal.app or SYSTEM_APP) if internal is not None else "",
+        "app": emitted_app(internal.app) if internal is not None else "",
         "layer": internal.layer if internal is not None else "",
         "precedence_rank": "",
         "is_btool_winner": "",

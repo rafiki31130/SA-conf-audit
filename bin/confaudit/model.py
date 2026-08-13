@@ -11,56 +11,95 @@ STAR = "*"
 #: special-case it (`eval app=if(isnull(app),"system",app)`) before the least
 #: aggregation, which defeats the flat output contract - `| stats count by app`
 #: must be right with no fix-up. Internally the layer still carries an empty app
-#: name (`LayerFile.app`), which is what keeps the `app=` filter a filter on
-#: APPS: the system layer carries no app and no `app=` pattern selects it.
+#: name (`LayerFile.app`); `emitted_app` below is the single place that turns
+#: that internal spelling into the one the field shows AND the one the `app=`
+#: filter matches against (D-38).
 SYSTEM_APP = "system"
 
-#: Field emitted only when `debug` is effective (D-17).
-DEBUG_FIELD = "file_path"
 
-#: Fields emitted only when `audit=true` (D-18): constant (`is_btool_winner` is
-#: always `true` when only winners are emitted) or redundant with `file_path`
-#: and `value` of the very same row.
-VERDICT_FIELDS = ("is_btool_winner", "btool_winner_path", "btool_winner_value")
+def emitted_app(app):
+    """The `app` value a layer is SEEN under - displayed and filtered alike.
+
+    `LayerFile.app` / `Definition.app` is empty on the system layers; the field
+    shows `system` (D-19) and, since D-38, the `app=` filter matches against
+    this very same spelling. One function, so the two can never drift apart
+    again: **whatever a field displays must be selectable by the filter that
+    corresponds to it** (D-38, general rule of the contract). The previous split
+    - display `system`, filter on apps only - meant an operator who read
+    `system` in a column and typed it into `app=` got zero rows.
+    """
+    return app or SYSTEM_APP
+
+
+#: The fifteen output fields in CONTRACT ORDER (D-37, CDC v1.7 section 5.1).
+#: The order is CONTRACTUAL: it is the order in which the columns must appear
+#: to a user who runs the command without `| table`, and it is deliberately not
+#: alphabetical. Every mode emits a SUBSEQUENCE of this tuple - which is what
+#: keeps the three orders consistent with one another by construction.
+CONTRACT_ORDER = (
+    "app", "layer", "scope", "conf", "stanza", "key", "value",
+    "is_btool_winner", "btool_winner_value", "precedence_rank",
+    "definition_count", "file_path", "btool_winner_path", "anomaly", "member",
+)
+
+#: The six fields of the default mode (`audit=false debug=false`): the
+#: definition and nothing else - what one reads, without its origin.
+DEFAULT_FIELDS = frozenset((
+    "conf", "stanza", "key", "value", "anomaly", "member",
+))
+
+#: The five fields `debug=true` adds (eleven in total): the physical and
+#: logical origin of the definition, plus the count that says the key is
+#: contested.
+DEBUG_FIELDS = frozenset((
+    "app", "layer", "scope", "definition_count", "file_path",
+))
+
+#: The four fields `audit=true` adds (fifteen in total): the btool verdict and
+#: the rank, meaningless when only winners are emitted.
+AUDIT_FIELDS = frozenset((
+    "is_btool_winner", "btool_winner_value", "precedence_rank",
+    "btool_winner_path",
+))
 
 
 def output_fields(audit, debug):
-    """The output fields of ONE invocation, in contract emission order.
+    """The output fields of ONE invocation, in contract order (D-37).
 
-    The output contract is **conditional** (CDC v1.3 section 5.1, D-17/D-18): a
-    field that is not relevant in a mode is not emitted with an empty value, it
-    is **not emitted at all** - an empty column stays visible in a result table
-    and makes the option indistinguishable in use.
+    The output contract is **conditional AND ordered** (CDC v1.7 section 5.1):
+    a field that is not relevant in a mode is not emitted with an empty value,
+    it is **not emitted at all** - an empty column stays visible in a result
+    table and makes the option indistinguishable in use; and the order below is
+    the order the columns must appear in.
 
-    | field                    | `audit=false` (default)      | `audit=true` |
-    |--------------------------|------------------------------|--------------|
-    | `file_path`              | only if `debug=true`         | always       |
-    | the three verdict fields | absent                       | present      |
-    | every other field        | present                      | present      |
+    - `audit=false debug=false` (6): `conf stanza key value anomaly member`;
+    - `audit=false debug=true` (11): `app layer scope conf stanza key value
+      definition_count file_path anomaly member`;
+    - `audit=true`, any `debug` (15): the whole of `CONTRACT_ORDER`.
 
-    `audit=true` implies `debug=true` (D-18); the caller resolves that
-    implication once, in `filters.validate_params`.
+    `audit=true` implies `debug=true` (D-18, kept by D-37); the caller resolves
+    that implication once, in `filters.validate_params`, and the `or audit`
+    below makes this function right even when called with the raw value.
+
+    D-37 revises D-18 on one point: `precedence_rank` and `definition_count`
+    used to be emitted in every mode. They are not any more - `definition_count`
+    comes back with `debug=true`, `precedence_rank` only in audit mode.
 
     The returned set holds CONTRACT FIELDS ONLY (D-34): the command is
     generating, never event-generating, so no `_raw` and no `_time` are ever
     part of a record.
     """
-    fields = []
-    if debug:
-        fields.append(DEBUG_FIELD)
-    fields.extend(
-        ("conf", "stanza", "key", "value", "scope", "app", "layer",
-         "precedence_rank")
-    )
+    emitted = set(DEFAULT_FIELDS)
+    if debug or audit:
+        emitted |= DEBUG_FIELDS
     if audit:
-        fields.extend(VERDICT_FIELDS)
-    fields.extend(("definition_count", "member", "anomaly"))
-    return tuple(fields)
+        emitted |= AUDIT_FIELDS
+    return tuple(name for name in CONTRACT_ORDER if name in emitted)
 
 
-#: The fifteen output fields of the contract, in emission order (CDC section 5.1,
-#: spec section 3.2) - the superset, emitted as such in `audit=true`. What one
-#: given invocation emits is `output_fields(audit, debug)`; a record carries
+#: The fifteen output fields of the contract, in contract order (CDC section
+#: 5.1, spec section 3.2) - the superset, emitted as such in `audit=true`. What
+#: one given invocation emits is `output_fields(audit, debug)`; a record carries
 #: those fields and nothing else (D-34).
 OUTPUT_FIELDS = output_fields(audit=True, debug=True)
 

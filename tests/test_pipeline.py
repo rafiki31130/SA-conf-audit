@@ -99,6 +99,105 @@ class BtoolFailureTest(unittest.TestCase):
         self.assertEqual({row["conf"] for row in rows}, {"probe"})
 
 
+#: The three field SEQUENCES of the contract (CDC v1.7 section 5.1, D-37),
+#: written out literally here rather than derived from the code: the order is
+#: contractual, so the test must fail when the code changes it, which asserting
+#: against `model.output_fields` could never do.
+FIELDS_DEFAULT = (
+    "conf", "stanza", "key", "value", "anomaly", "member",
+)
+FIELDS_DEBUG = (
+    "app", "layer", "scope", "conf", "stanza", "key", "value",
+    "definition_count", "file_path", "anomaly", "member",
+)
+FIELDS_AUDIT = (
+    "app", "layer", "scope", "conf", "stanza", "key", "value",
+    "is_btool_winner", "btool_winner_value", "precedence_rank",
+    "definition_count", "file_path", "btool_winner_path", "anomaly", "member",
+)
+
+
+class FieldOrderTest(unittest.TestCase):
+    """D-37: the field set of each mode, IN ITS CONTRACTUAL ORDER.
+
+    The order is what a user sees as the column order when the command runs
+    without `| table`; the chunked writer of the SDK derives the CSV header
+    from `list(record.keys())` of the first record of each chunk, so the key
+    order of the dict IS the column order. Every assertion here therefore
+    compares SEQUENCES (`tuple(row.keys())`), never sets.
+    """
+
+    def _mixed_fixture(self):
+        """A run yielding the three kinds of row at once: a definition, a
+        `parse_error` and a `resolver_mismatch`."""
+        fs = FakeFs()
+        bad = fs.add("app", "00_corp_base", "local", "probe", "[s]\nk = v\n")
+        fs.unreadable.add(bad)
+        p_ok = fs.add("app", "zz_sample_app", "local", "probe", "[s]\nk = zz\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (p_ok, "[s]"), (p_ok, "k = zz"),
+            (p_ok, "[ghost]"), (p_ok, "gk = gv"),
+        ])})
+        return fs, btool
+
+    def test_default_mode_emits_six_fields_in_order(self):
+        fs, btool, _ = _simple_fixture()
+        self.assertEqual(tuple(_run(fs, btool)[0].keys()), FIELDS_DEFAULT)
+        self.assertEqual(len(FIELDS_DEFAULT), 6)
+
+    def test_debug_mode_emits_eleven_fields_in_order(self):
+        fs, btool, _ = _simple_fixture()
+        self.assertEqual(
+            tuple(_run(fs, btool, debug=True)[0].keys()), FIELDS_DEBUG
+        )
+        self.assertEqual(len(FIELDS_DEBUG), 11)
+
+    def test_audit_mode_emits_fifteen_fields_in_order(self):
+        fs, btool, _ = _simple_fixture()
+        self.assertEqual(
+            tuple(_run(fs, btool, audit=True)[0].keys()), FIELDS_AUDIT
+        )
+        self.assertEqual(len(FIELDS_AUDIT), 15)
+
+    def test_audit_true_debug_false_is_the_audit_sequence_too(self):
+        # `audit=true` implies `debug=true` (D-18, kept by D-37).
+        fs, btool, _ = _simple_fixture()
+        row = _run(fs, btool, audit=True, debug=False)[0]
+        self.assertEqual(tuple(row.keys()), FIELDS_AUDIT)
+
+    def test_no_unexpected_field_comes_back_in_any_mode_on_any_row_kind(self):
+        """The guard: this fails the moment a field reappears in a mode that
+        must not emit it - on a definition row, a `parse_error` row or a
+        `resolver_mismatch` row alike, since all three are built by different
+        code paths and projected onto the same field set."""
+        expected = {
+            (False, False): FIELDS_DEFAULT,
+            (False, True): FIELDS_DEBUG,
+            (True, False): FIELDS_AUDIT,
+            (True, True): FIELDS_AUDIT,
+        }
+        for (audit, debug), sequence in expected.items():
+            fs, btool = self._mixed_fixture()
+            rows = _run(fs, btool, audit=audit, debug=debug)
+            self.assertEqual(
+                {row["anomaly"] for row in rows},
+                {"", "parse_error", "resolver_mismatch"},
+                (audit, debug),
+            )
+            for row in rows:
+                self.assertEqual(tuple(row.keys()), sequence, (audit, debug))
+
+    def test_the_three_sequences_are_subsequences_of_the_contract_order(self):
+        # Not a restatement of the code: it is what makes the three orders
+        # mutually consistent - a field never moves relative to another one
+        # from one mode to the next.
+        from confaudit.model import CONTRACT_ORDER
+        self.assertEqual(CONTRACT_ORDER, FIELDS_AUDIT)
+        for sequence in (FIELDS_DEFAULT, FIELDS_DEBUG):
+            kept = tuple(n for n in CONTRACT_ORDER if n in set(sequence))
+            self.assertEqual(kept, sequence)
+
+
 class RowShapeTest(unittest.TestCase):
 
     def test_fifteen_fields_in_contract_order_in_audit_mode(self):
@@ -157,10 +256,13 @@ class ConditionalFieldsTest(unittest.TestCase):
     """
 
     VERDICT = {"is_btool_winner", "btool_winner_path", "btool_winner_value"}
-    ALWAYS = {
-        "conf", "stanza", "key", "value", "scope", "app", "layer",
-        "precedence_rank", "definition_count", "member", "anomaly",
-    }
+    #: D-37 revises D-18: the default mode is reduced to the definition
+    #: itself - `app`, `layer`, `scope`, `definition_count` and `file_path`
+    #: come back with `debug=true`, the verdicts and `precedence_rank` only in
+    #: audit mode.
+    ALWAYS = set(FIELDS_DEFAULT)
+    DEBUG_ADDED = {"app", "layer", "scope", "definition_count", "file_path"}
+    AUDIT_ADDED = DEBUG_ADDED | VERDICT | {"precedence_rank"}
 
     def test_default_mode_omits_file_path_and_the_verdict_fields(self):
         fs, btool, _ = _simple_fixture()
@@ -169,16 +271,18 @@ class ConditionalFieldsTest(unittest.TestCase):
         self.assertEqual(keys & self.VERDICT, set())
         self.assertEqual(keys, self.ALWAYS)
 
-    def test_debug_true_adds_file_path_and_nothing_else(self):
+    def test_debug_true_adds_the_origin_fields_and_nothing_else(self):
         fs, btool, path = _simple_fixture()
         row = _run(fs, btool, debug=True)[0]
-        self.assertEqual(set(row), self.ALWAYS | {"file_path"})
+        self.assertEqual(set(row), self.ALWAYS | self.DEBUG_ADDED)
         self.assertEqual(row["file_path"], path)
+        self.assertEqual(set(row) & self.VERDICT, set())
+        self.assertNotIn("precedence_rank", row)
 
     def test_audit_true_adds_file_path_and_the_verdict_fields(self):
         fs, btool, path = _simple_fixture()
         row = _run(fs, btool, audit=True)[0]
-        self.assertEqual(set(row), self.ALWAYS | {"file_path"} | self.VERDICT)
+        self.assertEqual(set(row), self.ALWAYS | self.AUDIT_ADDED)
         self.assertEqual(row["file_path"], path)
 
     def test_audit_true_ignores_an_explicit_debug_false(self):
@@ -187,9 +291,11 @@ class ConditionalFieldsTest(unittest.TestCase):
         self.assertIn("file_path", row)
         self.assertEqual(row["file_path"], path)
 
-    def test_rank_and_count_stay_in_the_default_mode(self):
-        # Explicit CDP arbitration (D-18): they are the signal that makes one
-        # want to re-run in audit mode; removing them would hide conflicts.
+    def test_rank_and_count_left_the_default_mode(self):
+        # D-37 REVISES the D-18 arbitration: keeping `precedence_rank` and
+        # `definition_count` in every mode was a CDP bet on what a reader
+        # wants at first glance; use said otherwise. `definition_count` comes
+        # back with `debug=true`, `precedence_rank` only in audit mode.
         fs = FakeFs()
         p_sys = fs.add("system", "", "local", "probe", "[s]\nk = sys\n")
         fs.add("app", "00_corp_base", "local", "probe", "[s]\nk = app\n")
@@ -197,8 +303,28 @@ class ConditionalFieldsTest(unittest.TestCase):
             (p_sys, "[s]"), (p_sys, "k = sys"),
         ])})
         row = _run(fs, btool)[0]
+        self.assertNotIn("precedence_rank", row)
+        self.assertNotIn("definition_count", row)
+
+        fs, btool = self._contested_fixture()
+        row = _run(fs, btool, debug=True)[0]
+        self.assertEqual(row["definition_count"], 2)
+        self.assertNotIn("precedence_rank", row)
+
+        fs, btool = self._contested_fixture()
+        row = _run(fs, btool, audit=True)[0]
         self.assertEqual(row["precedence_rank"], 1)
         self.assertEqual(row["definition_count"], 2)
+
+    @staticmethod
+    def _contested_fixture():
+        fs = FakeFs()
+        p_sys = fs.add("system", "", "local", "probe", "[s]\nk = sys\n")
+        fs.add("app", "00_corp_base", "local", "probe", "[s]\nk = app\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (p_sys, "[s]"), (p_sys, "k = sys"),
+        ])})
+        return fs, btool
 
     def test_every_row_of_one_run_carries_the_very_same_keys(self):
         # The SDK's chunked writer freezes the column header on the FIRST
@@ -363,7 +489,7 @@ class SystemAppNameTest(unittest.TestCase):
 
     def test_app_layer_rows_keep_their_app_name(self):
         fs, btool, _ = _simple_fixture()
-        self.assertEqual(_run(fs, btool)[0]["app"], "00_corp_base")
+        self.assertEqual(_run(fs, btool, debug=True)[0]["app"], "00_corp_base")
 
     def test_parse_error_row_of_a_system_file_carries_app_system(self):
         fs = FakeFs()
@@ -373,7 +499,7 @@ class SystemAppNameTest(unittest.TestCase):
         btool = FakeBtool({"probe": build_btool_output([
             (p_ok, "[s]"), (p_ok, "k = ok"),
         ])})
-        rows = _run(fs, btool)
+        rows = _run(fs, btool, debug=True)
         error_row = [row for row in rows if row["anomaly"] == "parse_error"][0]
         self.assertEqual(error_row["app"], "system")
 
@@ -388,15 +514,172 @@ class SystemAppNameTest(unittest.TestCase):
         self.assertTrue(rows)
         self.assertNotIn("", {row["app"] for row in rows})
 
-    def test_app_filter_stays_a_filter_on_apps(self):
-        # `app=system` selects nothing: `system` is a display value, not an
-        # app name (the btool CLI has no `--app=system` either).
+
+class AppSystemFilterTest(unittest.TestCase):
+    """D-38: `app=system` selects the `etc/system/{local,default}` layers.
+
+    General rule the decision adds to the contract, verified beyond this single
+    case: **whatever a field displays must be selectable by the filter that
+    corresponds to it.** Since D-19 the `app` column shows `system`; until
+    v1.2.0 the `app=` filter refused that very value and returned zero rows.
+    """
+
+    @staticmethod
+    def _fixture():
+        """`[s] k` carried by system/local (winner), 00_corp_base and
+        zz_sample_app; `[s] app_only` carried by 00_corp_base alone."""
         fs = FakeFs()
         p_sys = fs.add("system", "", "local", "probe", "[s]\nk = sys\n")
+        p_00 = fs.add("app", "00_corp_base", "local", "probe",
+                      "[s]\nk = a00\napp_only = only\n")
+        p_zz = fs.add("app", "zz_sample_app", "default", "probe",
+                      "[s]\nk = azz\n")
         btool = FakeBtool({"probe": build_btool_output([
-            (p_sys, "[s]"), (p_sys, "k = sys"),
+            (p_sys, "[s]"), (p_sys, "k = sys"), (p_00, "app_only = only"),
         ])})
-        self.assertEqual(_run(fs, btool, app="system", audit=True), [])
+        return fs, btool, (p_sys, p_00, p_zz)
+
+    # -- filtering (audit=false) ----------------------------------------- #
+
+    def test_app_system_returns_the_system_layer_winners(self):
+        fs, btool, (p_sys, _, _) = self._fixture()
+        rows = _run(fs, btool, app="system", debug=True)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["file_path"], p_sys)
+        self.assertEqual((rows[0]["app"], rows[0]["scope"], rows[0]["key"]),
+                         ("system", "system", "k"))
+
+    def test_app_system_does_not_return_a_winner_carried_by_an_app(self):
+        # `app_only` wins from 00_corp_base: out of scope for `app=system`.
+        fs, btool, _ = self._fixture()
+        rows = _run(fs, btool, app="system", debug=True)
+        self.assertNotIn("app_only", [row["key"] for row in rows])
+
+    def test_what_the_field_displays_is_what_the_filter_selects(self):
+        # The rule of D-38, asserted as such: every distinct `app` value of an
+        # unfiltered run must be selectable by `app=<that value>`.
+        fs, btool, _ = self._fixture()
+        displayed = {row["app"] for row in _run(fs, btool, audit=True)}
+        self.assertEqual(displayed, {"system", "00_corp_base", "zz_sample_app"})
+        for value in sorted(displayed):
+            fs, btool, _ = self._fixture()
+            rows = _run(fs, btool, app=value, audit=True)
+            self.assertTrue(rows, value)
+            self.assertIn(value, {row["app"] for row in rows}, value)
+
+    # -- extrapolation (audit=true) -------------------------------------- #
+
+    def test_app_system_extrapolates_from_the_keys_it_carries(self):
+        fs, btool, (p_sys, p_00, p_zz) = self._fixture()
+        rows = _run(fs, btool, app="system", audit=True)
+        # `k` is carried by system: the whole group comes out, competitors
+        # in the two apps included. `app_only` is not carried by system.
+        self.assertEqual([row["key"] for row in rows], ["k", "k", "k"])
+        self.assertEqual([row["file_path"] for row in rows],
+                         [p_sys, p_00, p_zz])
+        self.assertEqual([row["app"] for row in rows],
+                         ["system", "00_corp_base", "zz_sample_app"])
+        self.assertEqual([row["precedence_rank"] for row in rows], [1, 2, 3])
+
+    def test_a_key_the_system_layer_does_not_carry_never_appears(self):
+        fs, btool, _ = self._fixture()
+        rows = _run(fs, btool, app="system", audit=True)
+        self.assertNotIn("app_only", [row["key"] for row in rows])
+
+    # -- non-regression of the real app names ---------------------------- #
+
+    def test_filtering_by_a_real_app_name_is_unchanged(self):
+        fs, btool, (_, p_00, _) = self._fixture()
+        rows = _run(fs, btool, app="00_corp_base", debug=True)
+        # `k`'s winner is the system one: still excluded. `app_only` wins in
+        # the app: still returned.
+        self.assertEqual([row["key"] for row in rows], ["app_only"])
+        self.assertEqual(rows[0]["file_path"], p_00)
+
+    def test_extrapolating_from_a_real_app_name_is_unchanged(self):
+        fs, btool, _ = self._fixture()
+        rows = _run(fs, btool, app="zz_*", audit=True)
+        self.assertEqual([row["key"] for row in rows], ["k", "k", "k"])
+        self.assertEqual([row["app"] for row in rows],
+                         ["system", "00_corp_base", "zz_sample_app"])
+
+    def test_a_pattern_matching_no_app_and_not_system_still_returns_nothing(self):
+        fs, btool, _ = self._fixture()
+        self.assertEqual(_run(fs, btool, app="no_such_app", audit=True), [])
+
+    # -- assumed consequences of the rule -------------------------------- #
+
+    def test_a_wildcard_now_covers_the_system_layer_too(self):
+        # Assumed: `app=*` selects everything the `app` column can display,
+        # `system` included - exactly like `| stats count by app` counts it.
+        fs, btool, _ = self._fixture()
+        rows = _run(fs, btool, app="*", audit=True)
+        self.assertIn("system", {row["app"] for row in rows})
+
+    def test_a_glob_prefix_matches_system_like_any_other_value(self):
+        fs, btool, _ = self._fixture()
+        rows = _run(fs, btool, app="sys*", audit=True)
+        self.assertEqual({row["app"] for row in rows},
+                         {"system", "00_corp_base", "zz_sample_app"})
+
+    def test_scope_still_separates_the_two_natures(self):
+        # `app=system` is now a filter like any other; `scope` remains what
+        # distinguishes a system layer from an app that happened to be named
+        # after it.
+        fs, btool, _ = self._fixture()
+        rows = _run(fs, btool, app="system", audit=True)
+        scopes = {row["app"]: row["scope"] for row in rows}
+        self.assertEqual(scopes["system"], "system")
+        self.assertEqual(scopes["00_corp_base"], "app")
+
+    # -- anomaly scoping (D-35 x D-38) ----------------------------------- #
+
+    @staticmethod
+    def _system_mismatch_fixture():
+        """A `resolver_mismatch` on a group carried by the system layer ALONE,
+        alongside a healthy group carried by an app."""
+        fs = FakeFs()
+        p_sys = fs.add("system", "", "local", "probe", "[s]\nk = sys\n")
+        p_00 = fs.add("app", "00_corp_base", "local", "probe",
+                      "[t]\nother = o\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (p_sys, "[s]"), (p_sys, "k = SOMETHING_ELSE"),
+            (p_00, "[t]"), (p_00, "other = o"),
+        ])})
+        return fs, btool
+
+    def test_a_mismatch_of_a_system_only_group_is_scoped_under_app_system(self):
+        fs, btool = self._system_mismatch_fixture()
+        rows = _run(fs, btool)
+        self.assertEqual([row["anomaly"] for row in rows].count(
+            "resolver_mismatch"), 1)
+
+        fs, btool = self._system_mismatch_fixture()
+        rows = _run(fs, btool, app="system")
+        self.assertIn("resolver_mismatch", [row["anomaly"] for row in rows])
+
+        fs, btool = self._system_mismatch_fixture()
+        rows = _run(fs, btool, app="00_corp_base")
+        self.assertNotIn("resolver_mismatch", [row["anomaly"] for row in rows])
+
+    def test_a_groupless_mismatch_on_a_system_path_is_scoped_as_system(self):
+        fs = FakeFs()
+        p_sys = fs.add("system", "", "local", "probe", "[s]\nk = v\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (p_sys, "[s]"), (p_sys, "k = v"),
+            (p_sys, "[zz_ghost]"), (p_sys, "ghost_key = ghost_val"),
+        ])})
+        rows = _run(fs, btool, stanza="zz_ghost", app="system")
+        self.assertEqual([row["anomaly"] for row in rows],
+                         ["resolver_mismatch"])
+
+        fs = FakeFs()
+        p_sys = fs.add("system", "", "local", "probe", "[s]\nk = v\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (p_sys, "[s]"), (p_sys, "k = v"),
+            (p_sys, "[zz_ghost]"), (p_sys, "ghost_key = ghost_val"),
+        ])})
+        self.assertEqual(_run(fs, btool, stanza="zz_ghost", app="00_*"), [])
 
 
 class RankCountFilterInsensitivityTest(unittest.TestCase):
@@ -632,7 +915,11 @@ class AnomalyScopingTest(unittest.TestCase):
         self.assertEqual(rows[0]["anomaly"], "resolver_mismatch")
         self.assertEqual((rows[0]["stanza"], rows[0]["key"]),
                          ("zz_ghost", "ghost_key"))
-        self.assertEqual(rows[0]["definition_count"], 0)
+        # `definition_count` left the default mode with D-37: read it where
+        # the mode emits it.
+        fs, btool = self._ghost_fixture()
+        row = _run(fs, btool, stanza="zz_ghost", debug=True)[0]
+        self.assertEqual(row["definition_count"], 0)
 
     def test_a_key_filter_scopes_a_mismatch_both_ways(self):
         fs, btool = self._ghost_fixture()
