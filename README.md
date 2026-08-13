@@ -181,9 +181,16 @@ that layer.
 `| confbtool` is a **generating** command, never an event-generating one. Its
 output is a set of records - the flat contract above and nothing else. **No
 `_raw` and no `_time` are ever produced**: a configuration definition has no
-raw text and no timestamp, and none is invented. Results therefore land in the
-statistics table, the job reports no events, and a search over this output must
-not rely on a time range.
+raw text and no timestamp, and none is invented. Results land in the statistics
+table, the job reports **no** events (`eventCount = 0`, an empty `/events`
+endpoint), and a search over this output must not rely on a time range.
+
+The command declares `type = reporting`, like the built-in generating commands
+that yield results (`| makeresults`, `| rest`). This is measured, not assumed:
+with the SDK default the metadata reads `stateful` and Splunk routes the output
+through the events pipeline anyway (`eventCount = resultCount`, `/events`
+serving the rows). A reporting command cannot be distributed either, but
+`distributed=false` is declared explicitly all the same - see *Known limits*.
 
 ## Typical audits
 
@@ -376,9 +383,11 @@ the pre-1.1.0 behaviour back.
 
 ## Known limits
 
-- **Single member**: the command runs on the member executing the search
-  (`distributed=false`) and audits that member's file system only. No
-  cross-member collection, no fleet aggregation.
+- **Single member**: the command runs on the member executing the search and
+  audits that member's file system only. No cross-member collection, no fleet
+  aggregation. Non-distribution is declared three times over, on purpose:
+  `distributed=False` explicitly on the command class, a `reporting` type that
+  the SDK will not distribute, and `local = true` in `commands.conf`.
 - **Global resolution only**: the resolution is the one of `btool` outside of
   any app or user context. `etc/users` is excluded by design - a user-layer
   definition has no rank in the global precedence order. No `--user`-style

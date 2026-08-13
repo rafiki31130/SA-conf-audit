@@ -308,33 +308,42 @@ class NoEventFieldsTest(unittest.TestCase):
 
 
 class CommandMetadataTest(unittest.TestCase):
-    """D-34: `distributed=False` is declared EXPLICITLY on the command class.
+    """D-34: the command declares no `events` type, and declares
+    `distributed=False` EXPLICITLY.
 
-    The `type='events'` of D-16 used to carry non-distribution by construction.
-    With the type gone, the only thing left in the SDK metadata is this
-    setting - under the chunked protocol it surfaces as `type = stateful`.
+    `type='reporting'` is what makes Splunk treat the output as results rather
+    than events (measured on the lab: with the SDK default the metadata reads
+    `stateful` and the job still reports `eventCount = resultCount`).
+    `distributed=False` is declared anyway - the lesson of D-34 is that a
+    guarantee implied by the type disappears the day the type changes.
     """
+
+    #: Types the SDK will let Splunk distribute. Anything else pins the
+    #: command to the search head.
+    DISTRIBUTABLE_TYPES = ("streaming",)
 
     def _configuration(self):
         import confbtool
         command = confbtool.ConfBtoolCommand()
         command._protocol_version = 2
-        return command
+        return command._configuration
 
     def test_the_class_declares_distributed_false(self):
-        self.assertIs(self._configuration()._configuration.distributed, False)
+        self.assertIs(self._configuration().distributed, False)
 
     def test_the_class_declares_no_events_type(self):
-        self.assertNotEqual(self._configuration()._configuration.type, "events")
+        self.assertNotEqual(self._configuration().type, "events")
 
     def test_the_chunked_metadata_reports_a_non_distributable_type(self):
-        # This is the byte Splunk actually receives. `stateful` is how the SDK
-        # renders "streaming but NOT distributable" in protocol v2; it also
-        # drops the `distributed` setting from the payload, which is why the
-        # explicit declaration has to be read here, not there.
-        settings = dict(self._configuration()._configuration.items())
-        self.assertEqual(settings["type"], "stateful")
+        # These are the bytes Splunk actually receives on getinfo. The SDK
+        # drops the `distributed` setting from the protocol-v2 payload, which
+        # is why the explicit declaration has to be read on the class, not
+        # here; what travels is the type, and it must not be distributable.
+        settings = dict(self._configuration().items())
+        self.assertEqual(settings["type"], "reporting")
+        self.assertNotIn(settings["type"], self.DISTRIBUTABLE_TYPES)
         self.assertNotIn("distributed", settings)
+        self.assertIs(settings["generating"], True)
 
 
 class SystemAppNameTest(unittest.TestCase):

@@ -51,15 +51,26 @@ from confaudit.rest import RestClient  # noqa: E402
 _APP_ROOT = os.path.dirname(_BIN)
 
 
-# `distributed=False` (D-34): the command is GENERATING, never event-
-# generating - it declares no `type` and emits records, not events. The
-# declaration is EXPLICIT because it is the only thing that carries the
-# `distributed=false` requirement of the CDC section 4 in the metadata: under
-# the chunked protocol the SDK drops the `distributed` setting itself and
-# instead reports `type = stateful` when it is false (`streaming` when it is
-# true), which is what tells Splunk the command must run on the search head
-# only. `local = true` in commands.conf is a second, independent barrier.
-@Configuration(distributed=False)
+# D-34 (cancels D-16): the command is GENERATING, never event-generating. Its
+# results are records, not events - no `_raw`, no `_time`, and the job must not
+# report them as events.
+#
+# `type='reporting'` is what carries that, and it was MEASURED (lab 9.4.6, from
+# the Search app) rather than assumed. Dropping `type='events'` is NOT enough:
+# with the SDK default the metadata reads `type = stateful` (streaming,
+# non-distributable) and Splunk still routes the output through the events
+# pipeline - `eventCount = resultCount`, `/search/jobs/<sid>/events` serves the
+# rows, `reportSearch` empty. With `type='reporting'` the same search reports
+# `eventCount = 0` and an empty `/events`, exactly like the built-in generating
+# commands that yield results (`| makeresults`, `| rest`). It is the reports
+# pipeline, not the events one; the command is still generating.
+#
+# `distributed=False` stays declared EXPLICITLY even though a reporting command
+# cannot be distributed anyway. That is the whole lesson of D-34: the previous
+# version leaned on a guarantee implied by the type, so removing the type
+# silently removed the guarantee. The declaration must survive any future change
+# of type. `local = true` in commands.conf is a third, independent barrier.
+@Configuration(type="reporting", distributed=False)
 class ConfBtoolCommand(GeneratingCommand):
     """Audit the file origin of configuration definitions, like btool --debug.
 
