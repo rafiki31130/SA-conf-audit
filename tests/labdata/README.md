@@ -215,13 +215,22 @@ cause.
 ```
 
 The `etc/system/{local,default}` definitions are counted under `app=system` -
-no `eval` fix-up needed. Note that `app=` remains a filter on **apps**:
-`app=system` selects nothing, `| where scope="system"` is the predicate for
-that layer.
+no `eval` fix-up needed. And `app=system` **selects** that layer, in filtering
+as in extrapolation: whatever a field displays is selectable by the filter that
+corresponds to it.
+
+```
+| confbtool labdemo app=system debug=true      -> the system-layer winners
+| confbtool labdemo app=system audit=true      -> and their competitors in the apps
+| confbtool labdemo app=zz_lab_high debug=true -> unchanged: filtering by a real app name
+```
+
+`scope` still separates the two natures, and `| where scope="system"` remains
+the predicate that never depends on an app being named `system`.
 
 ### L - what the mode changes in the output itself
 
-Run the three and look at the **columns**, not the values:
+Run the three and look at the **columns**, not the values - no `| table`:
 
 ```
 | confbtool labdemo
@@ -229,13 +238,17 @@ Run the three and look at the **columns**, not the values:
 | confbtool labdemo audit=true
 ```
 
-- default: no `file_path`, no verdict columns - 11 fields;
-- `debug=true`: `file_path` appears - 12;
-- `audit=true`: `file_path` **and** `is_btool_winner`, `btool_winner_path`,
-  `btool_winner_value` - the full 15. `audit=true debug=false` gives the same
-  thing: audit implies debug.
+The field set **and the column order** are fixed by mode:
+
+- default - **6**: `conf` `stanza` `key` `value` `anomaly` `member`;
+- `debug=true` - **11**: `app` `layer` `scope` `conf` `stanza` `key` `value`
+  `definition_count` `file_path` `anomaly` `member`;
+- `audit=true` - **15**: `app` `layer` `scope` `conf` `stanza` `key` `value`
+  `is_btool_winner` `btool_winner_value` `precedence_rank` `definition_count`
+  `file_path` `btool_winner_path` `anomaly` `member`. `audit=true debug=false`
+  gives the same thing: audit implies debug.
 
 Contract fields and nothing else: no `_raw`, no `_time` in any mode.
 
-`precedence_rank` and `definition_count` are there in every mode - they are
-what tells you a key is contested and worth a second look in `audit=true`.
+`definition_count` comes back with `debug=true` and `precedence_rank` only in
+audit mode: the default view is the definition, not its competition.

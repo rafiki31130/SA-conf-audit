@@ -145,7 +145,7 @@ longer pollutes an answer it does not concern:
 |  | `audit=false` (default) | `audit=true` |
 |---|---|---|
 | **without `app=`** | winning definitions only, one row per key | **every** concurrent definition, winners and shadowed |
-| **with `app=`** | winning definitions located in a matching app | **extrapolation**: for every key the matching app(s) carry, every concurrent definition is emitted - other apps and the `system` layers included |
+| **with `app=`** | winning definitions located in a matching app (or in `etc/system` for `app=system`) | **extrapolation**: for every key the matching app(s) carry, every concurrent definition is emitted - other apps and the `system` layers included |
 
 Extrapolation is the audit mode: `app=` selects the *keys* (those where the
 app carries at least one definition), and the emission then covers the whole
@@ -153,38 +153,73 @@ competition on those keys. A key the app does not carry never appears.
 Filters never prune the analysis: rank, winner verdict and definition count
 are always computed on the real, complete set of layers.
 
-### Output fields (one event per definition)
+### Output fields (one row per definition)
 
-| Field | Emitted | Meaning |
+**The field set and the column order are fixed by mode.** A field a mode does
+not carry is *not emitted at all* - never emitted empty - and the order below
+is the order the columns come out in, with no `| table` needed. It is not
+alphabetical: it is the reading order of an audit, from where a definition
+lives to what it says.
+
+| Mode | Fields, in order | n |
 |---|---|---|
-| `file_path` | `debug=true` **or** `audit=true` | absolute path of the file carrying the definition |
-| `conf` | always | conf name, without the `.conf` |
-| `stanza` | always | stanza name (`default` for keys written before any header) |
-| `key` | always | parameter name |
-| `value` | always | value, folded into one logical value, hashed if sensitive |
-| `scope` | always | `system` or `app` |
-| `app` | always | app name; **`system`** for `etc/system/{local,default}` |
-| `layer` | always | `local` or `default` |
-| `precedence_rank` | always | rank in the global precedence order, 1 = strongest |
-| `is_btool_winner` | `audit=true` | `true`/`false`, the btool verdict |
-| `btool_winner_path` | `audit=true` | the winner, repeated on every row of the group |
-| `btool_winner_value` | `audit=true` | idem |
-| `definition_count` | always | number of concurrent definitions of `(conf, stanza, key)` |
-| `member` | always | hostname of the member that ran the search |
-| `anomaly` | always | empty, `parse_error` or `resolver_mismatch` |
+| `audit=false debug=false` (default) | `conf` `stanza` `key` `value` `anomaly` `member` | 6 |
+| `audit=false debug=true` | `app` `layer` `scope` `conf` `stanza` `key` `value` `definition_count` `file_path` `anomaly` `member` | 11 |
+| `audit=true` (any `debug`) | `app` `layer` `scope` `conf` `stanza` `key` `value` `is_btool_winner` `btool_winner_value` `precedence_rank` `definition_count` `file_path` `btool_winner_path` `anomaly` `member` | 15 |
 
-In the default mode the three verdict fields would be constant
-(`is_btool_winner` is always `true` when only winners are emitted) or
-redundant with `file_path` and `value` of the very same row, so they are not
-emitted. `precedence_rank` and `definition_count` **are** emitted in every
-mode: they are what tells you a key is contested and worth a second look in
-`audit=true`.
+`audit=true` always implies `debug=true`; an explicit `debug=false` is ignored
+in that mode.
+
+| Field | Meaning |
+|---|---|
+| `app` | app name; **`system`** for `etc/system/{local,default}` |
+| `layer` | `local` or `default` |
+| `scope` | `system` or `app` |
+| `conf` | conf name, without the `.conf` |
+| `stanza` | stanza name (`default` for keys written before any header) |
+| `key` | parameter name |
+| `value` | value, folded into one logical value, hashed if sensitive |
+| `is_btool_winner` | `true`/`false`, the btool verdict |
+| `btool_winner_value` | value of the winner, repeated on every row of the group |
+| `precedence_rank` | rank in the global precedence order, 1 = strongest |
+| `definition_count` | number of concurrent definitions of `(conf, stanza, key)` |
+| `file_path` | absolute path of the file carrying the definition |
+| `btool_winner_path` | path of the winner, repeated on every row of the group |
+| `anomaly` | empty, `parse_error` or `resolver_mismatch` |
+| `member` | hostname of the member that ran the search |
+
+The default mode is deliberately short: the definition and nothing else. The
+verdict fields would be constant there (`is_btool_winner` is always `true` when
+only winners are emitted) or redundant with `file_path` and `value` of the very
+same row; `debug=true` brings back the origin of the definition and the count
+that says the key is contested, `audit=true` the whole competition.
+
+**One consequence to know**: in the default mode `file_path` is not emitted, so
+a `parse_error` row tells you **that** a file could not be read without telling
+you **which one**. The field set is uniform over the whole output - it cannot
+be added to the anomaly rows alone. Re-run with `debug=true` for the path.
 
 The output is strictly flat - directly usable by `stats`, `where`, `eval`,
 without transformation. `| stats count by app` is right with no `eval` fix-up,
-including for the system layer. Note that `app=` stays a filter on **apps**:
-`app=system` selects nothing, `| where scope="system"` is the predicate for
-that layer.
+including for the system layer.
+
+**Whatever a field displays is selectable by the filter that corresponds to
+it.** In particular `app=system` selects the `etc/system/{local,default}`
+layers, in filtering and in extrapolation alike:
+
+```
+| confbtool props app=system debug=true
+  -> the props.conf definitions that win from etc/system/{local,default}
+
+| confbtool props app=system audit=true
+  -> every definition of every props.conf key the system layer carries,
+     the competing app definitions included
+```
+
+`scope` still separates the two natures (`system` vs `app`), and
+`| where scope="system"` remains the predicate that never depends on an app
+being named `system`. Note the consequence on wildcards: `app=*` covers the
+system layer too, exactly as `| stats count by app` counts it.
 
 ### Records, not events
 
