@@ -51,12 +51,15 @@ from confaudit.rest import RestClient  # noqa: E402
 _APP_ROOT = os.path.dirname(_BIN)
 
 
-# `type='events'` (D-16): the command generates EVENTS, not a statistical
-# table - `| confbtool ...` lands in the Events tab, like any first command of
-# an events pipeline. An events-typed generating command is never distributed
-# (the SDK drops `distributed` from the metadata for this type), which keeps
-# the `distributed=false` requirement of the CDC satisfied by construction.
-@Configuration(type="events")
+# `distributed=False` (D-34): the command is GENERATING, never event-
+# generating - it declares no `type` and emits records, not events. The
+# declaration is EXPLICIT because it is the only thing that carries the
+# `distributed=false` requirement of the CDC section 4 in the metadata: under
+# the chunked protocol the SDK drops the `distributed` setting itself and
+# instead reports `type = stateful` when it is false (`streaming` when it is
+# true), which is what tells Splunk the command must run on the search head
+# only. `local = true` in commands.conf is a second, independent barrier.
+@Configuration(distributed=False)
 class ConfBtoolCommand(GeneratingCommand):
     """Audit the file origin of configuration definitions, like btool --debug.
 

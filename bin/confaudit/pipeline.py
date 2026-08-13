@@ -20,7 +20,7 @@ import time
 from . import btoolparser, confparser, filters, normalize, resolver, volume
 from .confront import confront
 from .errors import FatalBtoolError, FatalCapabilityError
-from .model import RAW_FIELD, STAR, SYSTEM_APP, AppSettings, output_fields
+from .model import STAR, SYSTEM_APP, AppSettings, output_fields
 from .secrets import (
     SecretMatcher,
     parse_encrypt_fields,
@@ -260,21 +260,15 @@ def run(fs, btool, rest, fieldnames, stanza=None, key=None, app=None,
     fields = output_fields(params.audit, params.debug)
     rows = []
     for conf, layer_file in parse_errors:
-        rows.append(
-            _project(_parse_error_row(conf, layer_file, member), fields,
-                     params.debug)
-        )
+        rows.append(_project(_parse_error_row(conf, layer_file, member), fields))
     for group, index, verdict in selected:
         rows.append(
             _project(
-                _definition_row(group, index, verdict, member, matcher),
-                fields, params.debug,
+                _definition_row(group, index, verdict, member, matcher), fields
             )
         )
     for anomaly in anomalies:
-        rows.append(
-            _project(_mismatch_row(anomaly, member, matcher), fields, params.debug)
-        )
+        rows.append(_project(_mismatch_row(anomaly, member, matcher), fields))
 
     # 9. Emission order (spec section 3.2): conf, stanza, key,
     # precedence_rank, code-point string comparisons. `parse_error` rows
@@ -306,33 +300,17 @@ def _match_key(group, splunk_home):
     )
 
 
-def _project(row, fields, debug):
-    """Keep only `fields`, in the order of `fields` (D-17, D-18), `_raw` first.
+def _project(row, fields):
+    """Keep only `fields`, in the order of `fields` (D-17, D-18).
 
     A field that is not relevant in the current mode is ABSENT from the record,
     never present with an empty value: an empty column stays visible in a
     result table, which is exactly what made `debug=` look like it did nothing.
+
+    A record carries the contract fields and NOTHING else (D-34): the command
+    is generating, never event-generating - no `_raw`, no `_time`.
     """
-    row[RAW_FIELD] = _synthetic_raw(row, debug)
     return {name: row[name] for name in fields}
-
-
-def _synthetic_raw(row, debug):
-    """Readable reconstruction of the definition, for the Events tab (D-16).
-
-    `<file_path> [<stanza>] <key> = <value>` when the path is emitted, else
-    `<conf>.conf [...]`: the raw text NEVER carries the path when `debug` is
-    false, otherwise it would leak through `_raw` exactly what `debug=false`
-    withholds. The value is the one already carried by the row, so a hashed
-    secret stays hashed here too.
-    """
-    prefix = row["file_path"] if debug else row["conf"] + ".conf"
-    if row["anomaly"] == "parse_error":
-        return "%s unreadable or undecodable (anomaly=parse_error)" % prefix
-    text = "%s [%s] %s = %s" % (prefix, row["stanza"], row["key"], row["value"])
-    if row["anomaly"]:
-        return "%s (anomaly=%s)" % (text, row["anomaly"])
-    return text
 
 
 def _sort_key(row):

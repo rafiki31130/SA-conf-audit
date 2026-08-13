@@ -2,8 +2,8 @@
 
 Covers: capability gate (exact message), btool failure (exact message, D-13),
 row shape and emission order, the CONDITIONAL field set of D-17/D-18 (asserted
-on the keys present, never on their content), the synthetic `_raw` and the
-absence of any fabricated `_time` (D-16), `app=system` (D-19), `parse_error`
+on the keys present, never on their content), the absence of ANY event field -
+neither `_raw` nor `_time` (D-34, which cancels D-16), `app=system` (D-19), `parse_error`
 never filtered, rank/count insensitive to filters, secrets end-to-end (`value`
 AND `btool_winner_value` hashed, no raw sensitive value in any row), upstream
 pruning, member field.
@@ -106,9 +106,8 @@ class RowShapeTest(unittest.TestCase):
         fs, btool, _ = _simple_fixture()
         rows = _run(fs, btool, audit=True)
         self.assertEqual(len(OUTPUT_FIELDS), 15)
-        # `_raw` leads every row (D-16); it is a rendering affordance, not a
-        # sixteenth contract field.
-        self.assertEqual(tuple(rows[0].keys()), ("_raw",) + OUTPUT_FIELDS)
+        # The contract fields, in contract order, and NOTHING else (D-34).
+        self.assertEqual(tuple(rows[0].keys()), OUTPUT_FIELDS)
 
     def test_nominal_row_content(self):
         fs, btool, path = _simple_fixture()
@@ -159,7 +158,6 @@ class ConditionalFieldsTest(unittest.TestCase):
 
     VERDICT = {"is_btool_winner", "btool_winner_path", "btool_winner_value"}
     ALWAYS = {
-        "_raw",
         "conf", "stanza", "key", "value", "scope", "app", "layer",
         "precedence_rank", "definition_count", "member", "anomaly",
     }
@@ -224,28 +222,78 @@ class ConditionalFieldsTest(unittest.TestCase):
             self.assertEqual(len(shapes), 1, kwargs)
 
 
-class SyntheticRawTest(unittest.TestCase):
-    """D-16: `_raw` is a readable reconstruction of the definition; `_time` is
-    never fabricated - a configuration definition has no timestamp."""
+class NoEventFieldsTest(unittest.TestCase):
+    """D-34 (cancels D-16) - GUARD: the command is generating, NEVER event-
+    generating. No record ever carries `_raw` or `_time`, in any mode.
 
-    def test_raw_carries_the_path_when_debug_is_on(self):
-        fs, btool, path = _simple_fixture()
-        row = _run(fs, btool, debug=True)[0]
-        self.assertEqual(row["_raw"], "%s [s] k = v1" % path)
+    This class exists to FAIL if either field comes back, by any route: the
+    field-set builder, the projection, or a row builder. D-16 had put a
+    synthetic `_raw` on every row and typed the command `events`; the decision
+    was wrong and its removal must not silently regress.
+    """
 
-    def test_raw_never_leaks_the_path_when_debug_is_off(self):
-        fs, btool, path = _simple_fixture()
-        row = _run(fs, btool)[0]
-        self.assertEqual(row["_raw"], "probe.conf [s] k = v1")
-        self.assertNotIn(path, row["_raw"])
+    #: Every field a Splunk record must not carry here. `_time` was never
+    #: fabricated (a configuration definition has no timestamp); `_raw` was,
+    #: and no longer is.
+    FORBIDDEN = ("_raw", "_time")
 
-    def test_no_row_ever_carries_a_time_field(self):
-        fs, btool, _ = _simple_fixture()
-        for kwargs in ({}, {"debug": True}, {"audit": True}):
+    def _all_modes(self):
+        return ({}, {"debug": True}, {"debug": False},
+                {"audit": True}, {"audit": True, "debug": False})
+
+    def _mixed_fixture(self):
+        """A run that yields the three kinds of row at once: a definition, a
+        `parse_error` (unreadable file) and a `resolver_mismatch` (a group
+        btool knows and we do not)."""
+        fs = FakeFs()
+        bad = fs.add("app", "00_corp_base", "local", "probe", "[s]\nk = v\n")
+        fs.unreadable.add(bad)
+        p_ok = fs.add("app", "zz_sample_app", "local", "probe", "[s]\nk = zz\n")
+        btool = FakeBtool({"probe": build_btool_output([
+            (p_ok, "[s]"), (p_ok, "k = zz"),
+            (p_ok, "[ghost]"), (p_ok, "gk = gv"),
+        ])})
+        return fs, btool
+
+    def test_no_emitted_record_carries_raw_or_time_in_any_mode(self):
+        fs, btool = self._mixed_fixture()
+        for kwargs in self._all_modes():
+            fs.read_paths = []
+            rows = _run(fs, btool, **kwargs)
+            self.assertEqual(
+                {row["anomaly"] for row in rows},
+                {"", "parse_error", "resolver_mismatch"},
+                kwargs,
+            )
+            for row in rows:
+                for name in self.FORBIDDEN:
+                    self.assertNotIn(name, row, (name, kwargs, row))
+
+    def test_no_record_carries_any_underscore_prefixed_field(self):
+        # Broader than the two names: every Splunk internal field is
+        # underscore-prefixed, and the output contract has none.
+        fs, btool = self._mixed_fixture()
+        for kwargs in self._all_modes():
+            fs.read_paths = []
             for row in _run(fs, btool, **kwargs):
-                self.assertNotIn("_time", row)
+                self.assertEqual(
+                    [name for name in row if name.startswith("_")], [], kwargs
+                )
 
-    def test_raw_of_a_sensitive_value_stays_hashed(self):
+    def test_the_field_set_builder_itself_yields_no_event_field(self):
+        from confaudit.model import OUTPUT_FIELDS, output_fields
+        for audit in (False, True):
+            for debug in (False, True):
+                fields = output_fields(audit=audit, debug=debug)
+                for name in self.FORBIDDEN:
+                    self.assertNotIn(name, fields, (name, audit, debug))
+        for name in self.FORBIDDEN:
+            self.assertNotIn(name, OUTPUT_FIELDS)
+
+    def test_a_hashed_secret_leaves_no_cleartext_anywhere_in_the_record(self):
+        # What the synthetic `_raw` used to risk - leaking a value or a path
+        # the mode withholds - is now structurally impossible: there is no
+        # field left outside the contract. Asserted on the whole record.
         fs = FakeFs()
         path = fs.add("app", "00_corp_base", "local", "probe",
                       "[s]\nsslPassword = $7$cipher_text\n")
@@ -253,22 +301,40 @@ class SyntheticRawTest(unittest.TestCase):
             (path, "[s]"), (path, "sslPassword = $7$cipher_text"),
         ])})
         row = _run(fs, btool)[0]
-        self.assertNotIn("$7$cipher_text", row["_raw"])
-        self.assertIn(hash_value("$7$cipher_text"), row["_raw"])
+        blob = " ".join(str(value) for value in row.values())
+        self.assertNotIn("$7$cipher_text", blob)
+        self.assertIn(hash_value("$7$cipher_text"), blob)
+        self.assertNotIn(path, blob)   # debug=false withholds the path
 
-    def test_anomaly_rows_carry_a_readable_raw(self):
-        fs = FakeFs()
-        bad = fs.add("app", "00_corp_base", "local", "probe", "[s]\nk = v\n")
-        fs.unreadable.add(bad)
-        p_ok = fs.add("app", "zz_sample_app", "local", "probe", "[s]\nk = zz\n")
-        btool = FakeBtool({"probe": build_btool_output([
-            (p_ok, "[s]"), (p_ok, "k = zz"),
-        ])})
-        row = _run(fs, btool, debug=True)[0]
-        self.assertEqual(row["anomaly"], "parse_error")
-        self.assertEqual(
-            row["_raw"], "%s unreadable or undecodable (anomaly=parse_error)" % bad
-        )
+
+class CommandMetadataTest(unittest.TestCase):
+    """D-34: `distributed=False` is declared EXPLICITLY on the command class.
+
+    The `type='events'` of D-16 used to carry non-distribution by construction.
+    With the type gone, the only thing left in the SDK metadata is this
+    setting - under the chunked protocol it surfaces as `type = stateful`.
+    """
+
+    def _configuration(self):
+        import confbtool
+        command = confbtool.ConfBtoolCommand()
+        command._protocol_version = 2
+        return command
+
+    def test_the_class_declares_distributed_false(self):
+        self.assertIs(self._configuration()._configuration.distributed, False)
+
+    def test_the_class_declares_no_events_type(self):
+        self.assertNotEqual(self._configuration()._configuration.type, "events")
+
+    def test_the_chunked_metadata_reports_a_non_distributable_type(self):
+        # This is the byte Splunk actually receives. `stateful` is how the SDK
+        # renders "streaming but NOT distributable" in protocol v2; it also
+        # drops the `distributed` setting from the payload, which is why the
+        # explicit declaration has to be read here, not there.
+        settings = dict(self._configuration()._configuration.items())
+        self.assertEqual(settings["type"], "stateful")
+        self.assertNotIn("distributed", settings)
 
 
 class SystemAppNameTest(unittest.TestCase):

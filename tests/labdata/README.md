@@ -229,11 +229,13 @@ Run the three and look at the **columns**, not the values:
 | confbtool labdemo audit=true
 ```
 
-- default: no `file_path`, no verdict columns - 11 fields plus `_raw`;
-- `debug=true`: `file_path` appears - 12 plus `_raw`;
+- default: no `file_path`, no verdict columns - 11 fields;
+- `debug=true`: `file_path` appears - 12;
 - `audit=true`: `file_path` **and** `is_btool_winner`, `btool_winner_path`,
-  `btool_winner_value` - the full 15 plus `_raw`. `audit=true debug=false`
-  gives the same thing: audit implies debug.
+  `btool_winner_value` - the full 15. `audit=true debug=false` gives the same
+  thing: audit implies debug.
+
+Contract fields and nothing else: no `_raw`, no `_time` in any mode.
 
 `precedence_rank` and `definition_count` are there in every mode - they are
 what tells you a key is contested and worth a second look in `audit=true`.

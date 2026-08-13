@@ -24,19 +24,6 @@ DEBUG_FIELD = "file_path"
 VERDICT_FIELDS = ("is_btool_winner", "btool_winner_path", "btool_winner_value")
 
 
-#: Synthetic raw text of an event (D-16). NOT a contract field: a rendering
-#: affordance for the Events tab, which displays the raw text of an event.
-#:
-#: Measured on the lab (Splunk 9.4.6, 2026-08-12): an `events`-typed generating
-#: command needs NEITHER `_raw` NOR `_time` to feed the events pipeline - the
-#: job reports `eventCount = resultCount` and `/search/jobs/<sid>/events`
-#: returns every row without either field. `_raw` is added because an event
-#: with no raw text renders as an empty line in the Events tab; `_time` is NOT
-#: fabricated (D-16): a configuration definition has no timestamp, and Splunk
-#: does not ask for one.
-RAW_FIELD = "_raw"
-
-
 def output_fields(audit, debug):
     """The output fields of ONE invocation, in contract emission order.
 
@@ -53,8 +40,12 @@ def output_fields(audit, debug):
 
     `audit=true` implies `debug=true` (D-18); the caller resolves that
     implication once, in `filters.validate_params`.
+
+    The returned set holds CONTRACT FIELDS ONLY (D-34): the command is
+    generating, never event-generating, so no `_raw` and no `_time` are ever
+    part of a record.
     """
-    fields = [RAW_FIELD]
+    fields = []
     if debug:
         fields.append(DEBUG_FIELD)
     fields.extend(
@@ -69,11 +60,9 @@ def output_fields(audit, debug):
 
 #: The fifteen output fields of the contract, in emission order (CDC section 5.1,
 #: spec section 3.2) - the superset, emitted as such in `audit=true`. What one
-#: given invocation emits is `output_fields(audit, debug)`, which prepends the
-#: non-contractual `_raw`.
-OUTPUT_FIELDS = tuple(
-    name for name in output_fields(audit=True, debug=True) if name != RAW_FIELD
-)
+#: given invocation emits is `output_fields(audit, debug)`; a record carries
+#: those fields and nothing else (D-34).
+OUTPUT_FIELDS = output_fields(audit=True, debug=True)
 
 
 @dataclass(frozen=True)

@@ -176,19 +176,14 @@ including for the system layer. Note that `app=` stays a filter on **apps**:
 `app=system` selects nothing, `| where scope="system"` is the predicate for
 that layer.
 
-### Events, `_raw` and `_time`
+### Records, not events
 
-`| confbtool` is an **events**-generating command: its output lands in the
-Events tab, not in the statistics table. Every row carries a synthetic `_raw`
-- a readable reconstruction of the definition, `<file_path> [<stanza>] <key> =
-<value>` (or `<conf>.conf [...]` when `debug=false`, so the raw text never
-leaks the path the mode withholds).
-
-**No `_time` is ever produced.** A configuration definition has no timestamp
-and none is invented. Measured on Splunk 9.4.6: the events pipeline needs
-neither `_raw` nor `_time` - `_raw` is added purely so the Events tab has
-something to display. Searches over this output must therefore not rely on a
-time range.
+`| confbtool` is a **generating** command, never an event-generating one. Its
+output is a set of records - the flat contract above and nothing else. **No
+`_raw` and no `_time` are ever produced**: a configuration definition has no
+raw text and no timestamp, and none is invented. Results therefore land in the
+statistics table, the job reports no events, and a search over this output must
+not rely on a time range.
 
 ## Typical audits
 
@@ -243,7 +238,7 @@ flowchart TD
     J --> K["Volume guard<br/>row count vs maxresultrows"]
     K -- over limit --> K1["Explicit refusal, no partial output"]
     K --> L["Secret hashing<br/>encrypt_fields + configurable patterns<br/>-> sha256:hexdigest"]
-    L --> N["Field set of the mode<br/>file_path if debug, verdict fields if audit,<br/>synthetic _raw - same keys on every row"]
+    L --> N["Field set of the mode<br/>file_path if debug, verdict fields if audit<br/>- same keys on every row, contract fields only"]
     N --> M["Sorted emission<br/>conf, stanza, key, precedence_rank"]
 ```
 
