@@ -222,7 +222,7 @@ corresponds to it.
 ```
 | confbtool labdemo app=system debug=true      -> the system-layer winners
 | confbtool labdemo app=system audit=true      -> and their competitors in the apps
-| confbtool labdemo app=zz_lab_high debug=true -> unchanged: filtering by a real app name
+| confbtool labdemo app=00_corp_base debug=true -> unchanged: filtering by a real app name
 ```
 
 `scope` still separates the two natures, and `| where scope="system"` remains
