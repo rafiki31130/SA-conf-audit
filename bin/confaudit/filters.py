@@ -12,7 +12,7 @@ import re
 
 from . import normalize
 from .errors import FatalUsageError
-from .model import Params, STAR
+from .model import Params, STAR, SYSTEM_APP, emitted_app
 
 #: Valid conf name (spec section 7.1) - covers `alert_actions`, `ui-prefs`, ...
 _CONF_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -117,23 +117,44 @@ def match_sk(group, params):
 
 def carried(group, app_rx):
     """`carried(G, app_pat)`: at least one definition of the group is carried
-    by an app whose name satisfies the pattern - the `system` scope carries no
-    app and never satisfies it.
+    by a location whose `app` value satisfies the pattern.
 
-    Note (D-19): the OUTPUT field `app` reads `system` on a system-layer row,
-    but `app=` stays a filter on apps, aligned with the `--app` of the btool
-    CLI, where no app is named `system`. `app=system` therefore selects
-    nothing; `scope="system"` is the SPL predicate for that layer."""
+    D-38: the location is matched under the name the `app` FIELD shows
+    (`emitted_app`), so `app=system` selects the `etc/system/{local,default}`
+    layers. Until v1.2.0 the predicate read `definition.scope == "app" and
+    app_rx.match(definition.app)`, aligned on the `--app` of the btool CLI where
+    no app is named `system` - so `app=system` selected nothing while the column
+    displayed `system` (D-19). A field that displays a value its own filter
+    refuses is indefensible: **whatever a field displays must be selectable by
+    the filter that corresponds to it**.
+
+    Consequence, assumed: `app=*` now also selects the system layer, exactly as
+    `| stats count by app` counts it. `scope="system"` / `scope="app"` remains
+    the predicate that separates the two natures.
+    """
     return any(
-        definition.scope == "app" and app_rx.match(definition.app)
-        for definition in group.defs
+        app_rx.match(emitted_app(definition.app)) for definition in group.defs
     )
 
 
+#: A `<...>/system/{local,default}/<conf>.conf` path - the shape `app_root`
+#: deliberately does not match, since the system layer carries no app directory.
+_SYSTEM_LAYER_PATH = re.compile(r"/system/(?:local|default)/[^/]+$")
+
+
 def _app_of_path(path):
-    """App name carrying a layer file, or `None` for a system-layer file."""
-    root = normalize.app_root(path) if path else None
-    return os.path.basename(root.rstrip("/")) if root else None
+    """`app` value of a layer file as the `app=` filter sees it (D-38).
+
+    The app directory name for an app layer, `system` for a system layer, and
+    `None` only when the path is absent or of neither shape - the genuinely
+    unscopable case, which `_anomaly_in_app` resolves by emitting.
+    """
+    if not path:
+        return None
+    root = normalize.app_root(path)
+    if root:
+        return os.path.basename(root.rstrip("/"))
+    return SYSTEM_APP if _SYSTEM_LAYER_PATH.search(path) else None
 
 
 def select_anomalies(anomalies, groups, params):
@@ -204,8 +225,8 @@ def select(groups, verdicts, params):
 
     - no `app=`, `audit=false`: `match_sk` groups, `is_btool_winner=true` rows;
     - no `app=`, `audit=true`: `match_sk` groups, every row;
-    - `app=`, `audit=false`: `match_sk` groups, winner rows whose app satisfies
-      the pattern (a `system` winner carries no app: excluded);
+    - `app=`, `audit=false`: `match_sk` groups, winner rows whose `app` value
+      satisfies the pattern - `app=system` keeps a `system` winner (D-38);
     - `app=`, `audit=true`: EXTRAPOLATION - `match_sk` and `carried` groups,
       every row of the group, competitors outside the app and the `system`
       layer included. `app=` selects the KEYS (those where the app carries at
@@ -231,6 +252,6 @@ def select(groups, verdicts, params):
                     selected.extend((group, i) for i in range(len(group.defs)))
             elif winner_index is not None:
                 winner = group.defs[winner_index]
-                if winner.scope == "app" and params.app_rx.match(winner.app):
+                if params.app_rx.match(emitted_app(winner.app)):
                     selected.append((group, winner_index))
     return selected

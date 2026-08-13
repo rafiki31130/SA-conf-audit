@@ -201,6 +201,46 @@ class MatrixTest(unittest.TestCase):
         )
         self.assertEqual(self._values(self._select(stanza="nope")), [])
 
+    # -- D-38: `app=system` selects the system layer ---------------------- #
+
+    def test_cell_app_system_no_audit_keeps_a_system_winner(self):
+        # k's winner is the system definition: `app=system` keeps it, and it
+        # alone (zz_key's winner is carried by an app).
+        self.assertEqual(self._values(self._select(app="system")),
+                         ["sys_wins"])
+
+    def test_cell_app_system_audit_extrapolates_from_the_system_keys(self):
+        # k is carried by the system layer: the WHOLE group comes out,
+        # competitors in the apps included. zz_key is not carried by system.
+        self.assertEqual(
+            self._values(self._select(app="system", audit=True)),
+            ["shadowed_00", "shadowed_zz", "sys_wins"],
+        )
+
+    def test_carried_matches_the_app_value_the_field_displays(self):
+        app_rx = filters.compile_filter("app", "system")
+        self.assertTrue(filters.carried(self.shared, app_rx))
+        self.assertFalse(filters.carried(self.zz_only, app_rx))
+
+    def test_filtering_by_a_real_app_name_did_not_regress(self):
+        # The exact assertions of the two cells above, re-run: D-38 must not
+        # have moved anything for a real app name.
+        self.assertEqual(self._values(self._select(app="zz_*")), ["zz_val"])
+        self.assertEqual(
+            self._values(self._select(app="zz_*", audit=True)),
+            ["shadowed_00", "shadowed_zz", "sys_wins", "zz_val"],
+        )
+
+    def test_a_wildcard_now_covers_the_system_layer_too(self):
+        # Assumed consequence of the D-38 rule: `app=*` selects everything the
+        # `app` column can display, `system` included.
+        self.assertEqual(
+            self._values(self._select(app="*", audit=True)),
+            ["shadowed_00", "shadowed_zz", "sys_wins", "zz_val"],
+        )
+        self.assertEqual(self._values(self._select(app="*")),
+                         ["sys_wins", "zz_val"])
+
     def test_rank_and_count_are_untouched_by_selection(self):
         # The matrix selects (group, index) pairs; the group object - hence
         # rank order and cardinal - is the resolution's, never rebuilt.
