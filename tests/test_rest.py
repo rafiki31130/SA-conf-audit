@@ -322,6 +322,128 @@ class CaMissingPathTest(RestTestCase):
         self.assertIn(OPERATOR_CA, failure.message)
 
 
+class NoSilentFallbackTest(RestTestCase):
+    """A DECLARED store never ends up as the platform's default trust store.
+
+    `README.md`, `README/confbtool.conf.spec` and `resolve_ca_file` all three
+    state that there is no quiet fallback. Until this test existed the claim
+    had a hole exactly one ordinary value wide: `ca_file = $SPLUNK_HOME` on a
+    search process whose environment carries no `$SPLUNK_HOME` expands to the
+    empty string, the missing-store guard reads a falsy path and steps aside,
+    and `ssl` receives `cafile=None` - which means "the platform's own store".
+    The run then verified against a store nobody chose while every message
+    still named `[rest] ca_file`.
+    """
+
+    #: Values whose `$SPLUNK_HOME` cannot be expanded. The first is the
+    #: reported case; the third is the very spelling `server.conf` ships, and
+    #: it is the one that silently re-anchors on the file system ROOT rather
+    #: than on nothing at all.
+    UNRESOLVABLE = (
+        "$SPLUNK_HOME", "  $SPLUNK_HOME  ", "$SPLUNK_HOME/etc/auth/cacert.pem",
+        "$SPLUNK_HOME/", "$SPLUNK_HOME\\etc\\auth\\cacert.pem",
+    )
+
+    def test_a_setting_whose_home_is_unknown_is_refused(self):
+        for raw in self.UNRESOLVABLE:
+            with self.subTest(value=raw):
+                resolution = rest.resolve_ca_file(raw, None, "", _present())
+                self.assertEqual(resolution.refusal, rest.REFUSAL_NO_HOME)
+                self.assertEqual(resolution.source, rest.CA_SOURCE_SETTING)
+                self.assertEqual(resolution.path, "")
+
+    def test_a_declaration_whose_home_is_unknown_is_refused_too(self):
+        """Same rule on both declared sources - the resolution has one code
+        path for the two, so they cannot drift apart."""
+        for raw in self.UNRESOLVABLE:
+            with self.subTest(value=raw):
+                resolution = rest.resolve_ca_file("", raw, "", _present())
+                self.assertEqual(resolution.refusal, rest.REFUSAL_NO_HOME)
+                self.assertEqual(resolution.source, rest.CA_SOURCE_SERVER_CONF)
+
+    def test_a_known_home_still_expands_normally(self):
+        """Calibration (CH-10.2): the refusal above must come from the ABSENT
+        home, not from the mere presence of the variable."""
+        resolution = rest.resolve_ca_file(
+            "$SPLUNK_HOME/etc/auth/cacert.pem", None, SPLUNK_HOME,
+            _present(SPLUNK_CA),
+        )
+        self.assertIsNone(resolution.refusal)
+        self.assertEqual(resolution.path, SPLUNK_CA)
+
+    def test_the_refusal_never_reaches_the_platform_store(self):
+        """The assertion the defect was hiding behind: `ssl` is not handed
+        `cafile=None`, it is not called at all, and no request is emitted."""
+        factory = self.use_context_factory(_ContextFactory())
+        urlopen = self.use_urlopen(
+            _Urlopen(payload=json.dumps(CURRENT_CONTEXT).encode("utf-8"))
+        )
+        resolution = rest.resolve_ca_file("$SPLUNK_HOME", None, "", _present())
+        capabilities, failure = self.client(ca=resolution).get_capabilities()
+
+        self.assertIsNone(capabilities, "fail-closed, not a default store")
+        self.assertEqual(failure.kind, rest.FAILURE_CA_FILE)
+        self.assertEqual(factory.cafiles, [])
+        self.assertEqual(urlopen.requests, [])
+
+        # CH-10.3: the two empty recorders above prove something only once the
+        # same recorders are shown to record, in this block, on this reading.
+        self.client(
+            ca=CaResolution(SPLUNK_CA, rest.CA_SOURCE_SPLUNK_DEFAULT, True)
+        ).get_capabilities()
+        self.assertEqual(factory.cafiles, [SPLUNK_CA])
+        self.assertEqual(len(urlopen.requests), 1)
+
+    def test_every_refusal_handle_has_its_own_sentence(self):
+        """CH-4.12: one table, one message per class of cause, and no handle
+        silently sharing another's wording."""
+        sentences = set()
+        for handle in (rest.REFUSAL_EMPTY, rest.REFUSAL_NO_HOME):
+            with self.subTest(refusal=handle):
+                self.use_context_factory(_ContextFactory())
+                self.use_urlopen(_Urlopen(payload=b"{}"))
+                client = self.client(
+                    ca=CaResolution("", rest.CA_SOURCE_SETTING, False, handle)
+                )
+                _, failure = client.get_capabilities()
+                self.assertEqual(failure.kind, rest.FAILURE_CA_FILE)
+                self.assertIn(rest.CA_SOURCE_SETTING, failure.message)
+                self.assertNotIn(SESSION_SENTINEL, failure.message)
+                sentences.add(failure.message)
+        self.assertEqual(len(sentences), 2)
+
+    def test_no_declared_source_can_reach_the_platform_store(self):
+        """Family sweep rather than the one value that was reported (CH-10.4).
+
+        Every shape a declared store can take, crossed with both declared
+        sources: none of them may come out labelled as the platform's own
+        store, and none may come out usable-and-empty.
+        """
+        shapes = (
+            "$SPLUNK_HOME", "$SPLUNK_HOME/", ".", "./", "   $SPLUNK_HOME   ",
+            OPERATOR_CA, "etc/auth/corp-root-ca.pem",
+            "$SPLUNK_HOME/etc/auth/cacert.pem",
+        )
+        seen = 0
+        for raw in shapes:
+            for configured, declared, source in (
+                (raw, None, rest.CA_SOURCE_SETTING),
+                ("", raw, rest.CA_SOURCE_SERVER_CONF),
+            ):
+                with self.subTest(value=raw, source=source):
+                    resolution = rest.resolve_ca_file(
+                        configured, declared, "", _present()
+                    )
+                    seen += 1
+                    self.assertEqual(resolution.source, source)
+                    self.assertNotEqual(
+                        resolution.source, rest.CA_SOURCE_SYSTEM_STORE
+                    )
+                    if not resolution.path:
+                        self.assertIsNotNone(resolution.refusal)
+        self.assertEqual(seen, len(shapes) * 2)
+
+
 class SslRootCaPathReadingTest(RestTestCase):
     """`server.conf [sslConfig] sslRootCAPath`, read through the library's own
     parser over the two SYSTEM layers."""

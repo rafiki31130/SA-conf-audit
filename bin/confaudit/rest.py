@@ -74,6 +74,13 @@ SPLUNK_CA_RELATIVE = "etc/auth/cacert.pem"
 # value (charter CH-4.12, CH-9.4).
 # --------------------------------------------------------------------------- #
 
+#: Machine handles of a CONFIGURED store the resolution refuses outright.
+#: Carried by `CaResolution.refusal`, turned into a message by
+#: `_refusal_failure`. Distinct from `exists=False`, which describes a path
+#: that is well formed and simply not there.
+REFUSAL_EMPTY = "empty_after_expansion"
+REFUSAL_NO_HOME = "splunk_home_unknown"
+
 FAILURE_TLS = "tls_verification_failed"
 FAILURE_CA_FILE = "ca_store_unusable"
 FAILURE_AUTH = "authentication_refused"
@@ -101,6 +108,37 @@ CA_FILE_MESSAGE = (
     "or point [rest] ca_file of SA-conf-audit/local/confbtool.conf at a "
     "readable CA bundle"
 )
+
+#: A store that WAS configured and whose path resolves to nothing at all.
+#: Handing `cafile=None` to `ssl` there would anchor the verification on the
+#: platform's default trust store while every message kept naming the setting:
+#: the silent fallback this whole resolution exists to forbid. `%s` =
+#: resolution path.
+CA_EMPTY_MESSAGE = (
+    "the CA store configured through %s resolves to an empty path, so no "
+    "store could be anchored. The check is refused rather than falling back "
+    "to the platform's default trust store: a verification anchored somewhere "
+    "nobody chose is worse than a loud refusal. Give an absolute path"
+)
+
+#: The same family, caught one step earlier: the path is WRITTEN against
+#: `$SPLUNK_HOME` and `$SPLUNK_HOME` is not in the environment of the search
+#: process. Expanding the variable to nothing would silently re-anchor the
+#: store on the file system root - `$SPLUNK_HOME/etc/auth/x.pem` becoming
+#: `/etc/auth/x.pem` - or leave nothing at all. Neither is the path anybody
+#: wrote. `%s` = resolution path.
+CA_NO_HOME_MESSAGE = (
+    "the CA store configured through %s is written against $SPLUNK_HOME, and "
+    "$SPLUNK_HOME is not set in the environment of the search process, so the "
+    "path cannot be resolved. The check is refused rather than anchoring the "
+    "verification on a path nobody configured. Give an absolute path"
+)
+
+#: Refusal handle -> sentence. `%s` = resolution path, in every entry.
+REFUSAL_MESSAGES = {
+    REFUSAL_EMPTY: CA_EMPTY_MESSAGE,
+    REFUSAL_NO_HOME: CA_NO_HOME_MESSAGE,
+}
 
 AUTH_MESSAGE = (
     "splunkd refused the authentication of the search's session key "
@@ -182,28 +220,63 @@ def resolve_ca_file(configured, ssl_root_ca_path, splunk_home, exists):
     `exists=False` travels into the diagnostic. A typo in `ca_file` must be
     visible as a typo, not silently downgraded to another store that happens
     to work - a silent downgrade is how a verification ends up anchored
-    somewhere nobody chose. Only (c) falls through, to the platform's default
+    somewhere nobody chose. A declaration under (a) or (b) that cannot yield a
+    usable path at all is REFUSED rather than resolved:
+    `CaResolution.refusal` carries the handle, the client turns it into a
+    fail-closed message. Only (c) falls through, to the platform's default
     trust store, when `cacert.pem` is absent - which is exactly what the 1.3.0
     wrapper already did.
+
+    So the claim holds without an asterisk: once a store is DECLARED, no input
+    to this function reaches the platform's default trust store.
 
     `exists` is an injected predicate (`os.path.isfile` in the wrapper): this
     module never touches the disk.
     """
     setting = (configured or "").strip()
     if setting:
-        path = expand_ca_path(setting, splunk_home)
-        return CaResolution(path, CA_SOURCE_SETTING, bool(exists(path)))
+        return _configured_resolution(setting, CA_SOURCE_SETTING, splunk_home,
+                                      exists)
 
     declared = (ssl_root_ca_path or "").strip()
     if declared:
-        path = expand_ca_path(declared, splunk_home)
-        return CaResolution(path, CA_SOURCE_SERVER_CONF, bool(exists(path)))
+        return _configured_resolution(declared, CA_SOURCE_SERVER_CONF,
+                                      splunk_home, exists)
 
     if splunk_home:
         path = _join(splunk_home, SPLUNK_CA_RELATIVE)
         if exists(path):
             return CaResolution(path, CA_SOURCE_SPLUNK_DEFAULT, True)
     return CaResolution("", CA_SOURCE_SYSTEM_STORE, True)
+
+
+def _configured_resolution(raw, source, splunk_home, exists):
+    """One `CaResolution` for a store the operator or the instance DECLARED.
+
+    Sources (a) and (b) share every rule, refusals included, so they share one
+    function: the day a refusal is added it cannot be added to one of the two
+    and forgotten on the other - which is how `ca_file` and `sslRootCAPath`
+    would start behaving differently on the same input.
+
+    Two refusals, both of the same family: a declaration that cannot yield the
+    path its author wrote.
+
+    - `$SPLUNK_HOME` in the value while `$SPLUNK_HOME` is unknown to the search
+      process. Expanding it to nothing turns `ca_file = $SPLUNK_HOME` into the
+      empty string and `$SPLUNK_HOME/etc/auth/x.pem` into `/etc/auth/x.pem` -
+      the file system root, not the installation. Neither is what was written;
+    - an expansion that lands on the EMPTY string for any other reason. That
+      one is the dangerous shape: `ssl` reads `cafile=None` as "use the
+      platform's default trust store", so the run would have carried on,
+      verified against a store nobody chose, with every message still naming
+      the setting. That is precisely the silent fallback the contract forbids.
+    """
+    if normalize.HOME_VARIABLE in raw and not splunk_home:
+        return CaResolution("", source, False, REFUSAL_NO_HOME)
+    path = expand_ca_path(raw, splunk_home)
+    if not path:
+        return CaResolution("", source, False, REFUSAL_EMPTY)
+    return CaResolution(path, source, bool(exists(path)))
 
 
 def _is_absolute(path):
@@ -273,6 +346,9 @@ class RestClient:
             self._context = context
             return
 
+        if self._ca.refusal is not None:
+            self._context_failure = self._refusal_failure()
+            return
         if self._ca.path and not self._ca.exists:
             self._context_failure = self._ca_file_failure()
             return
@@ -284,6 +360,18 @@ class RestClient:
             return
         context.check_hostname = False
         self._context = context
+
+    def _refusal_failure(self):
+        """The message of a CONFIGURED store the resolution refused.
+
+        One table, one lookup (CH-4.12): every refusal handle maps to a stable
+        sentence naming its class of cause. An unknown handle still fails
+        closed under the generic wording rather than passing through.
+        """
+        message = REFUSAL_MESSAGES.get(self._ca.refusal)
+        if message is None:
+            return self._ca_file_failure()
+        return RestFailure(FAILURE_CA_FILE, message % self._ca.source)
 
     def _ca_file_failure(self):
         return RestFailure(

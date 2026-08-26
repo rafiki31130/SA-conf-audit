@@ -437,6 +437,14 @@ and the command emits a warning naming it too. There is no quiet fallback to
 another store: a verification anchored somewhere nobody chose is worse than a
 loud refusal.
 
+The same refusal covers the two ways a declared path can fail to resolve at
+all: a value written against `$SPLUNK_HOME` while the search process carries
+no `$SPLUNK_HOME` in its environment, and a value that expands to an empty
+path. Both would otherwise re-anchor the verification silently - on the file
+system root, or on the platform's own trust store - while every message kept
+naming the setting. Once a store is **declared**, no value reaches the
+platform's default trust store.
+
 ### When the capability check cannot conclude
 
 Two refusals, deliberately worded apart:

@@ -274,11 +274,21 @@ class CaResolution:
     the error message is enough to know which of the three paths won. `exists`
     says whether `path` was found on disk: a configured but absent file is
     kept here and reported, never silently downgraded to another store.
+
+    `refusal` is the machine handle of a store that was CONFIGURED and that
+    the resolution refuses outright - one of the `REFUSAL_*` constants of
+    `rest.py`, `None` when there is nothing to refuse. It exists because
+    `exists=False` cannot carry every refusal: a setting that expands to an
+    empty path would otherwise be indistinguishable from "no setting at all",
+    which is exactly the silent fallback the resolution promises never to do.
+    The handle travels, not the sentence: the operator-facing wording lives in
+    `rest.py`, next to the other messages.
     """
 
     path: str
     source: str
     exists: bool
+    refusal: Optional[str] = None
 
 
 @dataclass(frozen=True)

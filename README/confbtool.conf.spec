@@ -90,5 +90,9 @@ ca_file = <path>
   exist: the capability check then fails with a message naming that file and
   the setting it came from. There is no silent fallback to another store - a
   verification anchored somewhere nobody chose is worse than a loud refusal.
+* A path set here, or declared in sslRootCAPath, that cannot be resolved at
+  all is refused rather than resolved: a value written against $SPLUNK_HOME
+  while the search process has no $SPLUNK_HOME in its environment, and a value
+  that expands to an empty path. Give an absolute path in that case.
 * Ignored when verify_ssl is false.
 * Default: empty
