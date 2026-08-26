@@ -522,10 +522,22 @@ class RestClient:
         """
         if self._context_failure is not None:
             return None, self._context_failure
-        request = urllib.request.Request(
-            self._base + path,
-            headers={"Authorization": "Splunk %s" % self._session_key},
-        )
+        # The `Request` is BUILT inside a guard, not just sent inside one.
+        # `urllib` parses the URL as it constructs the object, so an empty or
+        # malformed `splunkd_uri` - what the search process hands over when its
+        # metadata is incomplete - raised `ValueError: unknown url type`
+        # straight out of the module, past the contract stated at the top of
+        # this file. "No network exception escapes" has to cover the whole
+        # exchange, addressing included, or it is not a contract.
+        try:
+            request = urllib.request.Request(
+                self._base + path,
+                headers={"Authorization": "Splunk %s" % self._session_key},
+            )
+        except Exception as exc:  # noqa: BLE001 - classified, never propagated
+            return None, RestFailure(
+                FAILURE_NETWORK, NETWORK_MESSAGE % _reason_label(exc, None)
+            )
         try:
             with urllib.request.urlopen(
                 request, timeout=READ_TIMEOUT_SECONDS, context=self._context,

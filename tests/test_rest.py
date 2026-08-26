@@ -987,6 +987,35 @@ class NoExceptionEscapesTest(RestTestCase):
                 self.use_urlopen(_Urlopen(raises=shape))
                 self.assertIsNone(self.client().get_server_name())
 
+    def test_an_unusable_splunkd_address_never_escapes(self):
+        """The contract covers ADDRESSING too, not only the exchange.
+
+        `urllib.request.Request` parses the URL as it builds the object, and
+        the construction sat outside the `try`: an empty `splunkd_uri` - what
+        the search process hands over when its metadata is incomplete - raised
+        `ValueError: unknown url type` straight out of the module, past the
+        docstring that promises no network exception ever does.
+        """
+        for uri in ("", "   ", "not a url", "localhost"):
+            with self.subTest(uri=uri):
+                self.use_context_factory(_ContextFactory())
+                urlopen = self.use_urlopen(
+                    _Urlopen(payload=json.dumps(CURRENT_CONTEXT).encode("utf-8"))
+                )
+                client = rest.RestClient(uri, SESSION_SENTINEL)
+
+                capabilities, failure = client.get_capabilities()
+                self.assertIsNone(capabilities, "fail-closed")
+                self.assertEqual(failure.kind, rest.FAILURE_NETWORK)
+                self.assertNotIn(SESSION_SENTINEL, failure.message)
+                self.assertIsNone(client.get_server_name())
+                # Nothing was addressable, so nothing was sent.
+                self.assertEqual(urlopen.requests, [])
+
+                # CH-10.3: the recorder records, on the same reading.
+                rest.RestClient(URI, SESSION_SENTINEL).get_capabilities()
+                self.assertEqual(len(urlopen.requests), 1)
+
     def test_the_constructor_never_raises_on_an_unusable_store(self):
         self.use_context_factory(
             _ContextFactory(raises=OSError(2, "No such file or directory"))
