@@ -143,7 +143,7 @@ def _parse_bool(raw, default):
 
 def run(fs, btool, rest, fieldnames, stanza=None, key=None, app=None,
         audit=False, debug=False, settings=None, member="", etc_prefix="",
-        log=None, emit=None):
+        log=None, emit=None, on_authorized=None):
     """Execute the whole flow of spec section 1.2; return the ordered rows.
 
     Raises `FatalCapabilityError`, `FatalUsageError`, `FatalBtoolError` or
@@ -153,6 +153,12 @@ def run(fs, btool, rest, fieldnames, stanza=None, key=None, app=None,
     When `emit` is given, each row is passed to it in emission order and the
     return value is the row count; otherwise the list of rows is returned. In
     both cases no row is built before the volume guard has passed.
+
+    `on_authorized` is the hook the WRAPPER uses to hold its own startup
+    diagnostics back until the capability has been established (CH-4.15). It
+    is called once, after the check has concluded in the affirmative, and on
+    no other path: neither refusal reaches it. The wrapper cannot do this
+    ordering by itself, since the check that gates it lives here.
     """
     log = log if log is not None else NullLog()
     settings = settings if settings is not None else AppSettings()
@@ -174,6 +180,16 @@ def run(fs, btool, rest, fieldnames, stanza=None, key=None, app=None,
     if CAPABILITY not in capabilities:
         log.error("capability check refused: %s is absent" % CAPABILITY)
         raise FatalCapabilityError(CAPABILITY_MESSAGE)
+
+    # 1 bis. The capability is established - and only now may anything be
+    # emitted (CH-4.15). The wrapper's own startup diagnostics name the CA
+    # store it resolved, which is an infrastructure path; emitted before this
+    # point, they taught it to an operator the very next branch was about to
+    # refuse. Neither refusal above reaches this line, and that is deliberate:
+    # the fatal message of an impossible check already names the store and its
+    # source, so nothing diagnosable is lost.
+    if on_authorized is not None:
+        on_authorized()
 
     # 2. Parameters (spec section 7.1).
     params = filters.validate_params(

@@ -182,18 +182,28 @@ class ConfBtoolCommand(GeneratingCommand):
             splunk_home,
             os.path.isfile,
         )
-        if log is not None:
-            log.info(
-                "ca store: %s (from %s, present=%s)" % (
-                    ca.path or "-", ca.source, str(ca.exists).lower(),
+        # Both diagnostics below NAME the resolved CA store, which is an
+        # infrastructure path. CH-4.15 requires the capability check to precede
+        # every emission, and that check lives inside `pipeline.run`; emitted
+        # here they reached an operator the pipeline was about to refuse for
+        # lack of the right. They are deferred to `on_authorized`, which the
+        # pipeline calls once the capability is established and on no refusal
+        # path. Nothing diagnosable is lost when the check fails on the store
+        # itself: the fatal message already names the store and its source.
+        def _ca_store_diagnostics():
+            if log is not None:
+                log.info(
+                    "ca store: %s (from %s, present=%s)" % (
+                        ca.path or "-", ca.source, str(ca.exists).lower(),
+                    )
                 )
-            )
-        if settings.verify_ssl and ca.path and not ca.exists:
-            self.write_warning(
-                "confbtool: the CA store %s, resolved from %s, was not found; "
-                "the splunkd capability check cannot succeed until that path "
-                "is fixed." % (ca.path, ca.source)
-            )
+            if settings.verify_ssl and ca.path and not ca.exists:
+                self.write_warning(
+                    "confbtool: the CA store %s, resolved from %s, was not "
+                    "found; the splunkd capability check cannot succeed until "
+                    "that path is fixed." % (ca.path, ca.source)
+                )
+
         if not settings.verify_ssl:
             self.write_warning(
                 "confbtool: verify_ssl=false: verification of the splunkd "
@@ -221,6 +231,7 @@ class ConfBtoolCommand(GeneratingCommand):
             member=member,
             etc_prefix=file_system.etc_root,
             log=log,
+            on_authorized=_ca_store_diagnostics,
         )
 
 

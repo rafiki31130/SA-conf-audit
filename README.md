@@ -432,10 +432,15 @@ configured for that case**; `ca_file` exists for whatever the first two do not
 cover.
 
 A path coming from source 1 or 2 is used **even when it does not exist**. The
-check then fails with a message naming that file and the source it came from,
-and the command emits a warning naming it too. There is no quiet fallback to
-another store: a verification anchored somewhere nobody chose is worse than a
-loud refusal.
+check then fails with a message naming that file and the source it came from.
+There is no quiet fallback to another store: a verification anchored somewhere
+nobody chose is worse than a loud refusal.
+
+The command also emits a warning naming that store - but **only once the
+`run_confbtool` capability has been established**. A CA store path is
+infrastructure, and a caller who is about to be refused for want of the right
+has no business learning it. Nothing is lost by the wait: when the check fails
+*on the store itself*, the refusal message already names it.
 
 The same refusal covers the two ways a declared path can fail to resolve at
 all: a value written against `$SPLUNK_HOME` while the search process carries
