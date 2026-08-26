@@ -267,7 +267,20 @@ class CaMissingPathTest(RestTestCase):
 
     def test_an_absent_store_fails_the_check_and_names_the_file(self):
         """It must be diagnosable, not silent: the refusal names the path AND
-        the resolution path it came from."""
+        the resolution path it came from - and it costs ZERO network call.
+
+        Both seams are installed - `ssl.create_default_context` AND `urlopen` -
+        precisely because neither must be reached. Without them this test read
+        the real behaviour of `ssl` towards a path that merely happens not to
+        exist on the machine running it: it passed whether or not `rest.py`
+        still carried its guard (the mutation that deletes the guard survived
+        it), and on a host where that fixture path DID exist it would have
+        reached a real `urlopen` - which the suite forbids (CH-10.7).
+        """
+        factory = self.use_context_factory(_ContextFactory())
+        urlopen = self.use_urlopen(
+            _Urlopen(payload=json.dumps(CURRENT_CONTEXT).encode("utf-8"))
+        )
         client = self.client(
             ca=CaResolution(OPERATOR_CA, rest.CA_SOURCE_SETTING, False)
         )
@@ -277,17 +290,35 @@ class CaMissingPathTest(RestTestCase):
         self.assertIn(OPERATOR_CA, failure.message)
         self.assertIn(rest.CA_SOURCE_SETTING, failure.message)
 
+        # The assertion the guard actually exists for: a store that was
+        # declared and cannot be used is refused at context build time, so
+        # nothing is ever sent to splunkd and `ssl` is never even consulted.
+        self.assertEqual(urlopen.requests, [])
+        self.assertEqual(factory.cafiles, [])
+
+        # CH-10.3: the two zeros above are worth something only once the same
+        # recorders, read in the same block, are shown to record. One usable
+        # store, one context, one request.
+        self.client(
+            ca=CaResolution(SPLUNK_CA, rest.CA_SOURCE_SPLUNK_DEFAULT, True)
+        ).get_capabilities()
+        self.assertEqual(factory.cafiles, [SPLUNK_CA])
+        self.assertEqual(len(urlopen.requests), 1)
+
     def test_a_store_ssl_refuses_is_reported_as_unusable(self):
         """Present but not a CA bundle: `ssl` raises at context build time and
         the constructor must not let it out."""
         self.use_context_factory(
             _ContextFactory(raises=ssl.SSLError("no start line"))
         )
+        urlopen = self.use_urlopen(_Urlopen(payload=b"{}"))
         client = self.client(
             ca=CaResolution(OPERATOR_CA, rest.CA_SOURCE_SETTING, True)
         )
         _, failure = client.get_capabilities()
         self.assertEqual(failure.kind, rest.FAILURE_CA_FILE)
+        self.assertIn(OPERATOR_CA, failure.message)
+        self.assertEqual(urlopen.requests, [])
         self.assertIn(OPERATOR_CA, failure.message)
 
 
@@ -564,11 +595,13 @@ class NoExceptionEscapesTest(RestTestCase):
         self.use_context_factory(
             _ContextFactory(raises=OSError(2, "No such file or directory"))
         )
+        urlopen = self.use_urlopen(_Urlopen(payload=b"{}"))
         client = self.client(
             ca=CaResolution(OPERATOR_CA, rest.CA_SOURCE_SETTING, True)
         )
         _, failure = client.get_capabilities()
         self.assertEqual(failure.kind, rest.FAILURE_CA_FILE)
+        self.assertEqual(urlopen.requests, [])
 
 
 class SuccessPathTest(RestTestCase):
@@ -637,6 +670,8 @@ class SessionKeyConfinementTest(RestTestCase):
                 self.assertNotIn(SESSION_SENTINEL, failure.kind)
 
     def test_the_unusable_store_message_carries_no_key(self):
+        self.use_context_factory(_ContextFactory())
+        self.use_urlopen(_Urlopen(payload=b"{}"))
         client = self.client(
             ca=CaResolution(OPERATOR_CA, rest.CA_SOURCE_SETTING, False)
         )
