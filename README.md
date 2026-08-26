@@ -31,9 +31,22 @@ audit=true` gives it in one search.
 
 ## Installation
 
-1. Package or copy the app into `$SPLUNK_HOME/etc/apps/SA-conf-audit` (the
-   deployable archive carries `default/`, `bin/`, `metadata/`, `README.md`,
-   `LICENSE`).
+1. Install **the `.spl` asset attached to the release** - the file named
+   `SA-conf-audit-<version>.spl`. Unpacked, it yields a single root directory
+   `SA-conf-audit/`, carrying `default/`, `bin/`, `metadata/`, `README/`,
+   `README.md` and `LICENSE`. Drop it under `$SPLUNK_HOME/etc/apps/`, or
+   install it through Splunk Web.
+
+   > **Do not install from the "Source code (zip)" or "Source code (tar.gz)"
+   > archives.** GitHub attaches those to every release automatically, and
+   > their root directory carries the version - `SA-conf-audit-1.4.0/`. The
+   > app directory name IS the app name to Splunk, so installing from one of
+   > them yields an app called `SA-conf-audit-1.4.0`: the command is exported
+   > under the wrong app, `default/authorize.conf` declares the capability for
+   > an app nobody references, and every path documented here is off by one
+   > name. The prefix of those archives is not configurable on GitHub's side,
+   > which is why the `.spl` asset exists.
+
 2. Restart Splunk (a new search command and a new capability are declared).
 3. Nothing else: the app grants the `run_confbtool` capability to the `admin`
    role out of the box (`default/authorize.conf`), and exports the command
@@ -372,7 +385,9 @@ has no source file, therefore no origin to report, and is dropped.
 ## Configuration (`confbtool.conf`)
 
 Ship nothing: the defaults are functional. To override, create
-`SA-conf-audit/local/confbtool.conf`:
+`SA-conf-audit/local/confbtool.conf`. The reference for every setting is
+`README/confbtool.conf.spec`, shipped with the app; the block below is the
+shipped `default/`:
 
 ```ini
 [secrets]
@@ -389,7 +404,54 @@ level = INFO
 [rest]
 # TLS verification of the loopback splunkd calls.
 verify_ssl = true
+# CA store of that verification. Empty: resolved from the instance (see below).
+ca_file =
 ```
+
+### Which CA store the splunkd check is verified against
+
+The command calls splunkd on the loopback interface to read the capabilities
+of the running user. With `verify_ssl = true` - the default - that call
+verifies the certificate chain, and the store it verifies against is
+**resolved**, strongest first:
+
+| # | Source | When it applies |
+|---|---|---|
+| 1 | `[rest] ca_file` of `confbtool.conf` | Set and non-empty. The explicit escape hatch. |
+| 2 | `server.conf [sslConfig] sslRootCAPath` | Read on `etc/system/default` then `etc/system/local`, `local` winning. What the **instance itself** declares as its trust anchor. |
+| 3 | `$SPLUNK_HOME/etc/auth/cacert.pem` | Fallback: Splunk's own truststore. |
+
+`$SPLUNK_HOME` is expanded and a relative path is anchored on it, in both
+sources 1 and 2.
+
+Source 2 is what makes the command work out of the box on a member whose
+splunkd certificate has been replaced by an enterprise one: the CA that signs
+it is declared right there, and up to 1.3.0 the app read only source 3 -
+which does not carry it, so every check failed. **Nothing needs to be
+configured for that case**; `ca_file` exists for whatever the first two do not
+cover.
+
+A path coming from source 1 or 2 is used **even when it does not exist**. The
+check then fails with a message naming that file and the source it came from,
+and the command emits a warning naming it too. There is no quiet fallback to
+another store: a verification anchored somewhere nobody chose is worse than a
+loud refusal.
+
+### When the capability check cannot conclude
+
+Two refusals, deliberately worded apart:
+
+- the capability is **absent** - the check ran, the answer was read, the right
+  is not there. The message points at `authorize.conf`;
+- the check **could not be completed** - TLS verification failed, splunkd
+  refused the authentication, the call timed out, or the answer was
+  unreadable. The message names that cause, and for a TLS failure it names the
+  CA store that was actually used and the file to edit.
+
+Either way the command **refuses to run**: an impossible check never presumes
+the authorization. What changed in 1.4.0 is only that the second case stopped
+borrowing the first one's message - it used to accuse the rights, which were
+never the problem.
 
 ### Why some confs are exempt from the key patterns
 
@@ -484,6 +546,11 @@ deploys and removes it in one gesture. `tools/vendor.sh`
 rebuilds the vendored SDK reproducibly; `tools/verify_vendor.sh` checks it
 against `bin/lib/MANIFEST.sha256`.
 
+`README/confbtool.conf.spec` is the reference for the app's own settings, and
+`tests/test_conf_spec.py` holds it and `default/confbtool.conf` in
+correspondence **both ways**: a setting cannot be shipped without being
+specified, and a specified setting cannot vanish from what is shipped.
+
 ### Build pipeline
 
 `.github/workflows/ci.yml` runs on every push and every pull request, in three
@@ -493,7 +560,7 @@ jobs:
 |---|---|
 | `lint` | `ruff check .` (pinned version, config in `ruff.toml`, vendored SDK excluded), then re-reads every `default/*.conf` with the app's own parser - a malformed conf file is invisible to a Python linter and fatal at run time |
 | `test` | `python -m unittest discover -s tests` on Python 3.9 (the interpreter Splunk 9.4 embeds), 3.11 and 3.13, plus `tools/verify_vendor.sh` |
-| `package` | builds the `.spl`, asserts its five roots and the absence of `tests/`, `tools/` and `.github/`, publishes its sha256 in the job summary and uploads it as an artifact |
+| `package` | builds the `.spl`, asserts its six roots (`LICENSE`, `README`, `README.md`, `bin`, `default`, `metadata`) and the absence of `tests/`, `tools/` and `.github/`, publishes its sha256 in the job summary and uploads it as an artifact |
 
 The packaging step runs **the same `git archive` command as the release
 procedure** on the same tree, so the artifact of a run and the asset of a
@@ -501,7 +568,7 @@ release built from that commit are the same bytes:
 
 ```
 git archive --format=tar.gz --prefix=SA-conf-audit/ -o SA-conf-audit-<version>.spl \
-  <commit> -- default bin metadata README.md LICENSE
+  <commit> -- default bin metadata README README.md LICENSE
 ```
 
 No secret is used: the workflow only reads the checked-out tree, and the
