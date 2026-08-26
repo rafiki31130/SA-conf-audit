@@ -258,6 +258,42 @@ class AppSettings:
     )
     log_level: str = "INFO"
     verify_ssl: bool = True
+    # Explicit escape hatch of the CA resolution: when non-empty it outranks
+    # `server.conf [sslConfig] sslRootCAPath` and the Splunk truststore. Empty
+    # by default - the instance's own declaration is the better source.
+    ca_file: str = ""
+
+
+@dataclass(frozen=True)
+class CaResolution:
+    """The CA store the splunkd chain verification is anchored on.
+
+    `path` is what is handed to `ssl`; the empty string means the platform's
+    own default trust store. `source` is the human label of the resolution
+    path RETAINED - it is quoted verbatim in the diagnostic, so that reading
+    the error message is enough to know which of the three paths won. `exists`
+    says whether `path` was found on disk: a configured but absent file is
+    kept here and reported, never silently downgraded to another store.
+    """
+
+    path: str
+    source: str
+    exists: bool
+
+
+@dataclass(frozen=True)
+class RestFailure:
+    """Why a splunkd REST exchange could not be completed (spec section 10).
+
+    `kind` is one of the `FAILURE_*` constants of `rest.py` - the machine-side
+    handle, what a test asserts on; `message` is the operator-facing sentence,
+    which names the class of cause and, for a TLS failure, the CA store that
+    was actually used. Neither field ever carries a session key, a certificate
+    or a configuration value.
+    """
+
+    kind: str
+    message: str
 
 
 @dataclass(frozen=True)

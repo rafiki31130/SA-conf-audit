@@ -2,53 +2,305 @@
 
 The ONLY module of the package allowed to import `urllib.request`, `ssl` and
 `http` (layer rule of spec section 1.3, enforced by `tests/test_layering.py`).
+It never touches the DISK either: the `.conf` bytes it needs are handed over by
+`layers.py`, and the existence check of a CA file is an injected predicate
+(`os.path.isfile`, wired by the wrapper). That is what keeps the whole CA
+resolution unit-testable with no file system at all.
 
-The session key never appears in any log, error message or URL: it only lives
-in the `Authorization` header, and every failure comes back as `None` - the
-caller (pipeline section 10) never presumes the authorization on an impossible
-check.
+Two contracts hold here:
+
+- the session key never appears in any log, error message or URL: it only
+  lives in the `Authorization` header;
+- no network exception ever escapes the module - but, since 1.4.0, a failed
+  exchange no longer collapses into a bare `None`. It comes back as a
+  `RestFailure` that NAMES its cause, which is what lets the pipeline tell a
+  missing right from an impossible check (spec section 10). Collapsing the
+  two was the 1.3.0 defect: a splunkd certificate signed by an enterprise CA
+  produced the message about rights, and the rights were never the problem.
 """
 
 import json
 import ssl
+import urllib.error
 import urllib.request
+
+from . import confparser, normalize
+from .model import CaResolution, RestFailure
 
 #: Module constants (spec section 3.1). `urllib` applies a single timeout to
 #: the whole exchange; the read timeout, the larger of the two, is passed.
 CONNECT_TIMEOUT_SECONDS = 10
 READ_TIMEOUT_SECONDS = 30
 
+#: The two endpoints of the port.
+CURRENT_CONTEXT_PATH = "/services/authentication/current-context?output_mode=json"
+SERVER_INFO_PATH = "/services/server/info?output_mode=json"
+
+# --------------------------------------------------------------------------- #
+# CA store resolution (spec section 2.2; charter CH-9.13, CH-9.14, CH-9.19).
+#
+# CH-9.19 asks that the retained resolution path be NAMED and that the
+# forbidden ones be named with their failure mode. Retained, strongest first:
+# `[rest] ca_file`, then `server.conf [sslConfig] sslRootCAPath`, then Splunk's
+# own truststore. Forbidden, and why:
+#
+# - hardcoding `$SPLUNK_HOME/etc/auth/cacert.pem` as the ONLY store (what
+#   1.3.0 did): on any member whose splunkd certificate was replaced by an
+#   enterprise one, the chain is not in that file and every verification
+#   fails - while the information needed sits in `server.conf`, unread;
+# - leaning on the vendored SDK's REST client for the TLS layer: its default
+#   is `verify=False`, so it would trade a broken verification for no
+#   verification at all. `urllib` + `ssl` is used directly, here and nowhere
+#   else.
+# --------------------------------------------------------------------------- #
+
+#: Human labels of the resolution paths, quoted verbatim in the diagnostic.
+CA_SOURCE_SETTING = "[rest] ca_file of the app's confbtool.conf"
+CA_SOURCE_SERVER_CONF = "server.conf [sslConfig] sslRootCAPath"
+CA_SOURCE_SPLUNK_DEFAULT = "the Splunk truststore $SPLUNK_HOME/etc/auth/cacert.pem"
+CA_SOURCE_SYSTEM_STORE = "the platform's default trust store"
+
+#: Where the instance declares its trust anchor.
+SSL_STANZA = "sslConfig"
+SSL_KEY = "sslRootCAPath"
+
+#: Splunk's own truststore, relative to `$SPLUNK_HOME` - the fallback, and the
+#: only path 1.3.0 knew about.
+SPLUNK_CA_RELATIVE = "etc/auth/cacert.pem"
+
+# --------------------------------------------------------------------------- #
+# Failure taxonomy. `kind` is the machine handle a test asserts on; the
+# messages name the class of cause and the parameter in play, and never a
+# value (charter CH-4.12, CH-9.4).
+# --------------------------------------------------------------------------- #
+
+FAILURE_TLS = "tls_verification_failed"
+FAILURE_CA_FILE = "ca_store_unusable"
+FAILURE_AUTH = "authentication_refused"
+FAILURE_TIMEOUT = "timeout"
+FAILURE_UNREADABLE = "unreadable_answer"
+FAILURE_HTTP = "http_error"
+FAILURE_NETWORK = "endpoint_unreachable"
+
+#: Names TLS, names the CA store actually used, and names the file to edit -
+#: the three things that turn this failure into an immediate diagnosis
+#: (CH-9.13). `%s` = store, resolution path.
+TLS_MESSAGE = (
+    "TLS verification of the splunkd certificate failed against the CA store "
+    "%s, resolved from %s. If splunkd carries an enterprise certificate, "
+    "declare its CA in server.conf [sslConfig] sslRootCAPath, or point "
+    "[rest] ca_file of SA-conf-audit/local/confbtool.conf at it"
+)
+
+#: A store that was configured but cannot be used at all. Distinct from
+#: `TLS_MESSAGE`: nothing was even attempted, and the fix is a path, not a
+#: chain of trust. `%s` = store, resolution path.
+CA_FILE_MESSAGE = (
+    "the CA store %s, resolved from %s, is missing or unusable, so the "
+    "splunkd certificate could not even be checked against it. Fix that path, "
+    "or point [rest] ca_file of SA-conf-audit/local/confbtool.conf at a "
+    "readable CA bundle"
+)
+
+AUTH_MESSAGE = (
+    "splunkd refused the authentication of the search's session key "
+    "(HTTP %s); the capability could not be read"
+)
+
+TIMEOUT_MESSAGE = "splunkd did not answer within %d seconds"
+
+UNREADABLE_MESSAGE = (
+    "the splunkd answer on %s could not be read as the expected JSON document"
+)
+
+HTTP_MESSAGE = "splunkd answered HTTP %s on %s"
+
+NETWORK_MESSAGE = "the splunkd endpoint could not be reached (%s)"
+
+
+def read_ssl_root_ca_path(default_data, local_data):
+    """`server.conf [sslConfig] sslRootCAPath`, `local` winning over `default`.
+
+    Pure. The bytes of the two SYSTEM layers are read by the `layers` adapter
+    (`read_system_conf_bytes`) and parsed HERE by the library's own parser:
+    the project has exactly one `.conf` parser and this is it - a second one
+    would drift from the first on the very tolerances that were measured
+    against btool (spec section 4).
+
+    Returns `None` when neither layer carries the key.
+    """
+    value = None
+    for data in (default_data, local_data):
+        if data is None:
+            continue
+        text, _ = confparser.decode_conf_bytes(data)
+        for raw in confparser.parse_conf_text(text):
+            if raw.stanza == SSL_STANZA and raw.key == SSL_KEY:
+                value = raw.value
+    return value
+
+
+def expand_ca_path(raw, splunk_home):
+    """A CA path as written in a conf file, turned into a usable path.
+
+    `$SPLUNK_HOME` is expanded to its runtime value - `server.conf` ships
+    `sslRootCAPath = $SPLUNK_HOME/etc/auth/cacert.pem` in that very spelling -
+    and a relative path is anchored on `$SPLUNK_HOME`, which is how splunkd
+    reads it. The variable name is the one `normalize` already measured on the
+    corpus, not a second spelling of the same thing.
+
+    Path arithmetic only, deliberately not `os.path`: this module must stay
+    off the disk, and `os.path` semantics differ between the platform running
+    the tests and the platform running the app.
+    """
+    path = (raw or "").strip()
+    if not path:
+        return ""
+    if normalize.HOME_VARIABLE in path:
+        path = path.replace(normalize.HOME_VARIABLE, splunk_home or "")
+    if splunk_home and not _is_absolute(path):
+        path = _join(splunk_home, path)
+    return path
+
+
+def resolve_ca_file(configured, ssl_root_ca_path, splunk_home, exists):
+    """The CA store to verify the splunkd chain against, and WHERE it comes from.
+
+    Precedence, strongest first:
+
+    a. `[rest] ca_file` of the app's own `confbtool.conf` - the explicit escape
+       hatch, for whatever the two paths below do not cover;
+    b. `server.conf [sslConfig] sslRootCAPath` - what the INSTANCE itself
+       declares as its trust anchor. This is the path 1.3.0 was missing: on a
+       member whose splunkd certificate was replaced by an enterprise one, the
+       enterprise CA is declared right there, and the app simply did not read
+       it;
+    c. `$SPLUNK_HOME/etc/auth/cacert.pem` - Splunk's own truststore, the 1.3.0
+       behavior, kept as the fallback.
+
+    A path resolved by (a) or (b) is RETAINED even when it does not exist:
+    `exists=False` travels into the diagnostic. A typo in `ca_file` must be
+    visible as a typo, not silently downgraded to another store that happens
+    to work - a silent downgrade is how a verification ends up anchored
+    somewhere nobody chose. Only (c) falls through, to the platform's default
+    trust store, when `cacert.pem` is absent - which is exactly what the 1.3.0
+    wrapper already did.
+
+    `exists` is an injected predicate (`os.path.isfile` in the wrapper): this
+    module never touches the disk.
+    """
+    setting = (configured or "").strip()
+    if setting:
+        path = expand_ca_path(setting, splunk_home)
+        return CaResolution(path, CA_SOURCE_SETTING, bool(exists(path)))
+
+    declared = (ssl_root_ca_path or "").strip()
+    if declared:
+        path = expand_ca_path(declared, splunk_home)
+        return CaResolution(path, CA_SOURCE_SERVER_CONF, bool(exists(path)))
+
+    if splunk_home:
+        path = _join(splunk_home, SPLUNK_CA_RELATIVE)
+        if exists(path):
+            return CaResolution(path, CA_SOURCE_SPLUNK_DEFAULT, True)
+    return CaResolution("", CA_SOURCE_SYSTEM_STORE, True)
+
+
+def _is_absolute(path):
+    """POSIX absolute path, Windows drive path or UNC path."""
+    if path[:1] in ("/", "\\"):
+        return True
+    return len(path) >= 3 and path[1] == ":" and path[2] in ("/", "\\")
+
+
+def _join(base, relative):
+    """Join with the separator the base already uses - no `os.path`."""
+    separator = "\\" if ("\\" in base and "/" not in base) else "/"
+    return base.rstrip("/\\") + separator + relative.lstrip("/\\")
+
+
+def _is_timeout(exc):
+    """Timeout, without importing `socket`.
+
+    On Python 3.10+ `socket.timeout` IS `TimeoutError`; on 3.9 - the
+    interpreter Splunk 9.4 embeds - it is a distinct `OSError` subclass named
+    `timeout`. The name check covers the older platform without pulling a
+    module the layering rule keeps out of the package.
+    """
+    return isinstance(exc, TimeoutError) or type(exc).__name__ == "timeout"
+
+
+def _reason_text(reason):
+    if reason is None:
+        return "no reason reported"
+    text = str(reason).strip()
+    return text or type(reason).__name__
+
 
 class RestClient:
     """Minimal splunkd client: capability list and serverName."""
 
-    def __init__(self, splunkd_uri, session_key, verify_ssl=True, ca_file=None):
+    def __init__(self, splunkd_uri, session_key, verify_ssl=True, ca=None):
         self._base = (splunkd_uri or "").rstrip("/")
         self._session_key = session_key or ""
-        self._context = self._build_context(verify_ssl, ca_file)
+        self._ca = ca if ca is not None else CaResolution(
+            "", CA_SOURCE_SYSTEM_STORE, True
+        )
+        self._context = None
+        #: Set when no usable TLS context could be built at all. Every
+        #: exchange then returns it: the run fails closed AND says why.
+        self._context_failure = None
+        self._build_context(verify_ssl)
 
-    @staticmethod
-    def _build_context(verify_ssl, ca_file):
+    def _build_context(self, verify_ssl):
         """TLS context per `[rest] verify_ssl` (spec section 2.2).
 
-        `verify_ssl=true`: chain verified against the provided CA file
-        (`$SPLUNK_HOME/etc/auth/cacert.pem`), hostname check disabled - the
-        splunkd URI is a loopback address and the default Splunk certificates
-        carry no matching SAN. `verify_ssl=false`: no verification (the
-        wrapper emits a single startup warning).
+        `verify_ssl=true`: chain verified against the RESOLVED CA store,
+        hostname check disabled - the splunkd URI is a loopback address and
+        the default Splunk certificates carry no matching SAN. The hostname is
+        not the variable in play here; the chain of trust is.
+
+        `verify_ssl=false`: no verification (the wrapper emits a single
+        startup warning).
+
+        Never raises: a store that `ssl` refuses becomes a `RestFailure`, so
+        the wrapper cannot die on a missing file while wiring its adapters.
         """
-        if verify_ssl:
-            context = ssl.create_default_context(cafile=ca_file)
+        if not verify_ssl:
+            context = ssl.create_default_context()
             context.check_hostname = False
-            return context
-        context = ssl.create_default_context()
+            context.verify_mode = ssl.CERT_NONE
+            self._context = context
+            return
+
+        if self._ca.path and not self._ca.exists:
+            self._context_failure = self._ca_file_failure()
+            return
+        try:
+            context = ssl.create_default_context(cafile=self._ca.path or None)
+        except (OSError, ValueError):
+            # Absent, unreadable, or not a PEM bundle at all.
+            self._context_failure = self._ca_file_failure()
+            return
         context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        return context
+        self._context = context
+
+    def _ca_file_failure(self):
+        return RestFailure(
+            FAILURE_CA_FILE,
+            CA_FILE_MESSAGE % (self._ca.path or CA_SOURCE_SYSTEM_STORE,
+                               self._ca.source),
+        )
 
     def _get_json(self, path):
-        """GET a splunkd endpoint; `None` on ANY failure - no network
-        exception ever propagates out of this module (spec section 3.1)."""
+        """GET a splunkd endpoint; returns `(document, failure)`.
+
+        Exactly one of the two is `None`. No network exception propagates out
+        of this module (spec section 3.1) - each one is CLASSIFIED instead of
+        being swallowed.
+        """
+        if self._context_failure is not None:
+            return None, self._context_failure
         request = urllib.request.Request(
             self._base + path,
             headers={"Authorization": "Splunk %s" % self._session_key},
@@ -57,27 +309,85 @@ class RestClient:
             with urllib.request.urlopen(
                 request, timeout=READ_TIMEOUT_SECONDS, context=self._context,
             ) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except Exception:  # noqa: BLE001 - converted into an error result
-            return None
+                payload = response.read().decode("utf-8")
+        except Exception as exc:  # noqa: BLE001 - classified, never propagated
+            return None, self._classify(exc, path)
+        try:
+            return json.loads(payload), None
+        except Exception as exc:  # noqa: BLE001 - classified, never propagated
+            return None, self._classify(exc, path)
+
+    def _classify(self, exc, path):
+        """Name the class of cause of one failed exchange (CH-4.12, CH-9.13).
+
+        The order matters, and so does the unwrapping: `urlopen` does NOT let
+        the `ssl.SSLCertVerificationError` through, it comes back wrapped in a
+        `URLError` whose `reason` carries it. A classifier written against the
+        theoretical exception alone misses the nominal case - which is the
+        measured lesson CH-9.13 is built on, and `tests/test_rest.py` freezes
+        both shapes.
+        """
+        if isinstance(exc, urllib.error.HTTPError):
+            if exc.code in (401, 403):
+                return RestFailure(FAILURE_AUTH, AUTH_MESSAGE % exc.code)
+            return RestFailure(FAILURE_HTTP, HTTP_MESSAGE % (exc.code, path))
+
+        reason = getattr(exc, "reason", None)
+        candidates = (exc, reason)
+        if any(isinstance(item, ssl.SSLError) for item in candidates):
+            return RestFailure(
+                FAILURE_TLS,
+                TLS_MESSAGE % (self._ca.path or CA_SOURCE_SYSTEM_STORE,
+                               self._ca.source),
+            )
+        if any(_is_timeout(item) for item in candidates):
+            return RestFailure(
+                FAILURE_TIMEOUT, TIMEOUT_MESSAGE % READ_TIMEOUT_SECONDS
+            )
+        if isinstance(exc, ValueError):
+            # `json.JSONDecodeError` and `UnicodeDecodeError` both land here.
+            return RestFailure(FAILURE_UNREADABLE, UNREADABLE_MESSAGE % path)
+        if isinstance(exc, urllib.error.URLError):
+            return RestFailure(
+                FAILURE_NETWORK, NETWORK_MESSAGE % _reason_text(reason)
+            )
+        return RestFailure(
+            FAILURE_NETWORK, NETWORK_MESSAGE % type(exc).__name__
+        )
 
     # -- RestPort -------------------------------------------------------- #
 
     def get_capabilities(self):
-        """Capabilities of the current context, roles cumulated - `None` when
-        the check itself failed (spec section 10)."""
-        document = self._get_json(
-            "/services/authentication/current-context?output_mode=json"
-        )
+        """`(capabilities, failure)` - exactly one of the two is `None`.
+
+        RestPort contract widened in 1.4.0 (spec section 1.4): 1.3.0 returned
+        a bare `None` for an impossible check, so the pipeline could only emit
+        the message about rights. The nature of the failure now travels with
+        the answer; the fail-closed decision of spec section 10 is untouched -
+        a check that could not be completed still never presumes the
+        authorization.
+        """
+        document, failure = self._get_json(CURRENT_CONTEXT_PATH)
+        if failure is not None:
+            return None, failure
         try:
-            return frozenset(document["entry"][0]["content"]["capabilities"])
+            capabilities = document["entry"][0]["content"]["capabilities"]
         except (TypeError, KeyError, IndexError):
-            return None
+            return None, RestFailure(
+                FAILURE_UNREADABLE, UNREADABLE_MESSAGE % CURRENT_CONTEXT_PATH
+            )
+        return frozenset(capabilities), None
 
     def get_server_name(self):
         """`serverName` of the member, `None` when unavailable (the wrapper
-        falls back to the local hostname)."""
-        document = self._get_json("/services/server/info?output_mode=json")
+        falls back to the local hostname).
+
+        No failure is surfaced here on purpose: the fallback is legitimate and
+        silent, where an unverifiable capability must be loud.
+        """
+        document, failure = self._get_json(SERVER_INFO_PATH)
+        if failure is not None:
+            return None
         try:
             name = document["entry"][0]["content"]["serverName"]
         except (TypeError, KeyError, IndexError):
