@@ -12,8 +12,8 @@ bin/lib/** -text
 tests/fixtures/** -text
 
 # Scope of the deployable archive (spec section 2.1): the .spl carries default/,
-# bin/, metadata/, README.md and LICENSE; tests/ and tools/ live in the
-# repository only. `git archive` therefore leaves them out, along with the
+# bin/, metadata/, README/ (the conf spec), README.md and LICENSE; tests/ and
+# tools/ live in the repository only. `git archive` therefore leaves them out, along with the
 # repository's own service files.
 tests/         export-ignore
 tools/         export-ignore
