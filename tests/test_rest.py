@@ -245,6 +245,168 @@ class CaPathExpansionTest(RestTestCase):
         self.assertFalse(resolution.exists)
 
 
+class CaPathAdversarialTest(RestTestCase):
+    """CH-9.18: the path guard normalises like its consumer, segment by
+    segment, and a relative declaration may not leave the anchor the contract
+    gives it.
+
+    `ca_file` and `sslRootCAPath` are both administrator-held settings, and a
+    bad path here fails closed rather than opening anything - but CH-9.18 is
+    written `exigé` with no dispensation for a trusted source, and the promise
+    the contract actually makes is testable: "a relative path is anchored on
+    $SPLUNK_HOME". `../../../../etc/passwd` reached `ssl` verbatim and
+    designated a file that has nothing to do with $SPLUNK_HOME, so the promise
+    was not kept.
+    """
+
+    #: Spellings of the same escape, including the graphies CH-9.18 names.
+    TRAVERSALS = (
+        "../../../../etc/passwd",
+        "..\\..\\..\\..\\etc\\passwd",
+        "./../../etc/passwd",
+        "etc/../../../etc/passwd",
+        "etc/auth/../../../../etc/passwd",
+        "  ../../etc/passwd  ",
+        "\xa0../../etc/passwd",
+        "..//..//etc/passwd",
+    )
+
+    #: Graphies that look adversarial and are NOT: they designate a file under
+    #: `$SPLUNK_HOME` and must resolve, or the guard would be refusing valid
+    #: configurations (CH-10.2 - a refusal that refuses everything proves
+    #: nothing).
+    BENIGN = (
+        "./etc/auth/corp-root-ca.pem",
+        "etc//auth//corp-root-ca.pem",
+        "etc/./auth/corp-root-ca.pem",
+        "etc/auth/../auth/corp-root-ca.pem",
+        "\xa0etc/auth/corp-root-ca.pem",
+        "etc/auth/corp-root-ca.pem/",
+    )
+
+    def test_a_relative_path_that_climbs_above_splunk_home_is_refused(self):
+        for raw in self.TRAVERSALS:
+            for configured, declared, source in (
+                (raw, None, rest.CA_SOURCE_SETTING),
+                ("", raw, rest.CA_SOURCE_SERVER_CONF),
+            ):
+                with self.subTest(value=raw, source=source):
+                    resolution = rest.resolve_ca_file(
+                        configured, declared, SPLUNK_HOME, _present()
+                    )
+                    self.assertEqual(
+                        resolution.refusal, rest.REFUSAL_TRAVERSAL
+                    )
+                    self.assertEqual(resolution.path, "")
+                    self.assertEqual(resolution.source, source)
+
+    def test_a_benign_graphy_still_resolves(self):
+        for raw in self.BENIGN:
+            with self.subTest(value=raw):
+                resolution = rest.resolve_ca_file(
+                    raw, None, SPLUNK_HOME, _present(ENTERPRISE_CA)
+                )
+                self.assertIsNone(resolution.refusal)
+                self.assertEqual(resolution.path, ENTERPRISE_CA)
+                self.assertTrue(resolution.exists)
+
+    def test_a_percent_sequence_is_not_decoded_into_a_separator(self):
+        """`ssl` and OpenSSL do not decode percent sequences, so neither does
+        the guard: `..%2F..` is a file name, not a traversal. Decoding it here
+        would invent an escape the file system will never perform - and
+        normalising differently from the consumer is the defect CH-9.18 is
+        about, in either direction."""
+        for raw in ("..%2F..%2Fetc%2Fpasswd", "..%252F..%252Fetc"):
+            with self.subTest(value=raw):
+                resolution = rest.resolve_ca_file(
+                    raw, None, SPLUNK_HOME, _present()
+                )
+                self.assertIsNone(resolution.refusal)
+                self.assertIn("%2", resolution.path)
+                self.assertTrue(resolution.path.startswith(SPLUNK_HOME))
+
+    def test_an_absolute_path_outside_splunk_home_stays_allowed(self):
+        """The anchor binds the RELATIVE form only. An operator bundle under
+        `/etc/pki` is the documented case and must keep working."""
+        resolution = rest.resolve_ca_file(
+            OPERATOR_CA, None, SPLUNK_HOME, _present(OPERATOR_CA)
+        )
+        self.assertIsNone(resolution.refusal)
+        self.assertEqual(resolution.path, OPERATOR_CA)
+
+    def test_the_guard_and_ssl_receive_the_very_same_string(self):
+        """CH-9.18 as an equality rather than an intention.
+
+        The string the existence predicate is asked about and the string `ssl`
+        is handed are the same object of comparison, so no spelling can be
+        validated on one side and read as another resource on the other.
+        """
+        asked = []
+
+        def exists(path):
+            asked.append(path)
+            return True
+
+        factory = self.use_context_factory(_ContextFactory())
+        for raw in (
+            "etc/./auth//corp-root-ca.pem",
+            "etc/auth/../auth/corp-root-ca.pem",
+            "./etc/auth/corp-root-ca.pem",
+            "$SPLUNK_HOME/etc/auth/../auth/corp-root-ca.pem",
+            OPERATOR_CA,
+        ):
+            with self.subTest(value=raw):
+                del asked[:]
+                del factory.cafiles[:]
+                resolution = rest.resolve_ca_file(
+                    raw, None, SPLUNK_HOME, exists
+                )
+                self.client(ca=resolution)
+                self.assertEqual(len(asked), 1)
+                self.assertEqual(factory.cafiles, [resolution.path])
+                self.assertEqual(asked, factory.cafiles)
+
+    def test_a_refused_traversal_costs_no_network_call(self):
+        factory = self.use_context_factory(_ContextFactory())
+        urlopen = self.use_urlopen(
+            _Urlopen(payload=json.dumps(CURRENT_CONTEXT).encode("utf-8"))
+        )
+        resolution = rest.resolve_ca_file(
+            "../../../../etc/passwd", None, SPLUNK_HOME, _present()
+        )
+        capabilities, failure = self.client(ca=resolution).get_capabilities()
+
+        self.assertIsNone(capabilities)
+        self.assertEqual(failure.kind, rest.FAILURE_CA_FILE)
+        self.assertIn(rest.CA_SOURCE_SETTING, failure.message)
+        self.assertEqual(factory.cafiles, [])
+        self.assertEqual(urlopen.requests, [])
+
+        # CH-10.3: the same two recorders, shown to record.
+        self.client(
+            ca=CaResolution(SPLUNK_CA, rest.CA_SOURCE_SPLUNK_DEFAULT, True)
+        ).get_capabilities()
+        self.assertEqual(factory.cafiles, [SPLUNK_CA])
+        self.assertEqual(len(urlopen.requests), 1)
+
+    def test_the_normalisation_itself_reports_what_it_folded(self):
+        """Unit level, so the table above cannot pass by accident of the
+        surrounding resolution."""
+        cases = (
+            ("etc/./auth//x.pem", "etc/auth/x.pem", 0),
+            ("etc/auth/../x.pem", "etc/x.pem", 0),
+            ("../x.pem", "x.pem", 1),
+            ("a/../../../x.pem", "x.pem", 2),
+            ("/opt/splunk/etc/../auth/x.pem", "/opt/splunk/auth/x.pem", 0),
+            ("C:\\Splunk\\etc\\.\\auth\\x.pem", "C:\\Splunk\\etc\\auth\\x.pem", 0),
+            ("\\\\host\\share\\x.pem", "\\\\host\\share\\x.pem", 0),
+            (".", "", 0),
+        )
+        for raw, expected, escapes in cases:
+            with self.subTest(value=raw):
+                self.assertEqual(rest.normalize_ca_path(raw), (expected, escapes))
+
+
 class CaMissingPathTest(RestTestCase):
     """A configured path that is not there stays visible - never a silent
     downgrade to another store."""

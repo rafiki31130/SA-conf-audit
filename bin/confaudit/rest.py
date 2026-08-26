@@ -80,6 +80,7 @@ SPLUNK_CA_RELATIVE = "etc/auth/cacert.pem"
 #: that is well formed and simply not there.
 REFUSAL_EMPTY = "empty_after_expansion"
 REFUSAL_NO_HOME = "splunk_home_unknown"
+REFUSAL_TRAVERSAL = "escapes_its_anchor"
 
 FAILURE_TLS = "tls_verification_failed"
 FAILURE_CA_FILE = "ca_store_unusable"
@@ -134,10 +135,20 @@ CA_NO_HOME_MESSAGE = (
     "verification on a path nobody configured. Give an absolute path"
 )
 
+#: A RELATIVE declaration whose `..` segments climb above the anchor the
+#: contract gives it. `%s` = resolution path.
+CA_TRAVERSAL_MESSAGE = (
+    "the CA store configured through %s is a relative path that climbs above "
+    "$SPLUNK_HOME through its parent segments. A relative path is anchored on "
+    "$SPLUNK_HOME and may not leave it; give an absolute path if the store "
+    "really lives outside the installation"
+)
+
 #: Refusal handle -> sentence. `%s` = resolution path, in every entry.
 REFUSAL_MESSAGES = {
     REFUSAL_EMPTY: CA_EMPTY_MESSAGE,
     REFUSAL_NO_HOME: CA_NO_HOME_MESSAGE,
+    REFUSAL_TRAVERSAL: CA_TRAVERSAL_MESSAGE,
 }
 
 AUTH_MESSAGE = (
@@ -178,14 +189,85 @@ def read_ssl_root_ca_path(default_data, local_data):
     return value
 
 
+def _split_root(path):
+    """`(root, remainder)` - the leading absolute prefix, and what follows.
+
+    The root is kept VERBATIM rather than rebuilt: a drive letter, a UNC
+    double separator and a POSIX leading slash are three different things and
+    only the original spelling says which one is meant.
+    """
+    if len(path) >= 3 and path[1] == ":" and path[2] in ("/", "\\"):
+        return path[:3], path[3:]
+    if path[:2] in ("//", "\\\\"):
+        return path[:2], path[2:]
+    if path[:1] in ("/", "\\"):
+        return path[:1], path[1:]
+    return "", path
+
+
+def normalize_ca_path(path):
+    """`path` normalised the way its consumer reads it (CH-9.18).
+
+    Returns `(normalised, escapes)`. `escapes` counts the `..` segments that
+    climbed past the head of the path - past `$SPLUNK_HOME` for the relative
+    form the contract anchors there, past the root for an absolute one.
+
+    Segment by segment, never by an anchored regular expression: `.`, an empty
+    segment (a doubled separator) and `..` are resolved exactly as the file
+    system resolves them, so the path this function returns designates the
+    same resource as the string handed to `ssl` - because it IS that string.
+    A guard that normalises differently from the component it protects
+    validates one spelling and lets another through, which is the whole reason
+    the rule exists.
+
+    Two deliberate non-normalisations, both of them "like the consumer":
+
+    - percent sequences are NOT decoded. `ssl` and OpenSSL do not decode them
+      either, so `x%2Fy` is one segment named `x%2Fy`, and treating it as a
+      separator would invent a traversal the file system will never perform;
+    - the case of the segments is left alone. Nothing here compares a path to
+      an allow-list, so folding case would only lose information.
+
+    A backslash counts as a separator on every platform. On Linux it is a
+    legal file name character, so this is stricter than the local file system
+    - but it is the spelling `_is_absolute` and `_join` already use in this
+    module, and being stricter can only turn a store into a refusal, never a
+    refusal into a store.
+    """
+    root, remainder = _split_root(path)
+    separator = "\\" if ("\\" in path and "/" not in path) else "/"
+    kept = []
+    escapes = 0
+    for segment in remainder.replace("\\", "/").split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if kept:
+                kept.pop()
+            else:
+                escapes += 1
+            continue
+        kept.append(segment)
+    return root + separator.join(kept), escapes
+
+
 def expand_ca_path(raw, splunk_home):
     """A CA path as written in a conf file, turned into a usable path.
 
+    Returns `(path, escapes)`; `escapes` is the count `normalize_ca_path`
+    reports, non-zero when the declaration climbs above its anchor.
+
     `$SPLUNK_HOME` is expanded to its runtime value - `server.conf` ships
     `sslRootCAPath = $SPLUNK_HOME/etc/auth/cacert.pem` in that very spelling -
-    and a relative path is anchored on `$SPLUNK_HOME`, which is how splunkd
-    reads it. The variable name is the one `normalize` already measured on the
-    corpus, not a second spelling of the same thing.
+    then the path is normalised segment by segment, and only then is a
+    relative path anchored on `$SPLUNK_HOME`, which is how splunkd reads it.
+    The order matters: normalising BEFORE the anchoring is what makes an
+    escape visible at all. Anchor first and `../../etc/passwd` becomes
+    `/opt/splunk/../../etc/passwd`, which normalises to a perfectly ordinary
+    `/etc/passwd` with nothing left to say it was ever relative.
+
+    The variable name is the one `normalize` already measured on the corpus,
+    not a second spelling of the same thing.
 
     Path arithmetic only, deliberately not `os.path`: this module must stay
     off the disk, and `os.path` semantics differ between the platform running
@@ -193,12 +275,13 @@ def expand_ca_path(raw, splunk_home):
     """
     path = (raw or "").strip()
     if not path:
-        return ""
+        return "", 0
     if normalize.HOME_VARIABLE in path:
         path = path.replace(normalize.HOME_VARIABLE, splunk_home or "")
-    if splunk_home and not _is_absolute(path):
+    path, escapes = normalize_ca_path(path)
+    if splunk_home and path and not _is_absolute(path):
         path = _join(splunk_home, path)
-    return path
+    return path, escapes
 
 
 def resolve_ca_file(configured, ssl_root_ca_path, splunk_home, exists):
@@ -270,10 +353,18 @@ def _configured_resolution(raw, source, splunk_home, exists):
       platform's default trust store", so the run would have carried on,
       verified against a store nobody chose, with every message still naming
       the setting. That is precisely the silent fallback the contract forbids.
+
+    And one refusal of a different nature (CH-9.18): a declaration whose `..`
+    segments climb above the anchor it was given. `ca_file =
+    ../../../../etc/passwd` is documented as anchored on `$SPLUNK_HOME`, and
+    it designates a file that has nothing to do with `$SPLUNK_HOME`. The
+    anchoring is a promise the contract makes; this is what keeps it.
     """
     if normalize.HOME_VARIABLE in raw and not splunk_home:
         return CaResolution("", source, False, REFUSAL_NO_HOME)
-    path = expand_ca_path(raw, splunk_home)
+    path, escapes = expand_ca_path(raw, splunk_home)
+    if escapes:
+        return CaResolution("", source, False, REFUSAL_TRAVERSAL)
     if not path:
         return CaResolution("", source, False, REFUSAL_EMPTY)
     return CaResolution(path, source, bool(exists(path)))

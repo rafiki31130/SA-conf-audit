@@ -445,6 +445,14 @@ system root, or on the platform's own trust store - while every message kept
 naming the setting. Once a store is **declared**, no value reaches the
 platform's default trust store.
 
+Paths are normalised **segment by segment** - `.`, `..` and doubled separators
+resolved as the file system resolves them, percent sequences left alone
+because `ssl` leaves them alone too. A **relative** path that climbs above
+`$SPLUNK_HOME` through `..` is refused: the anchoring documented above is a
+promise, and a path that leaves the installation is not the one that promise
+describes. An **absolute** path outside `$SPLUNK_HOME` stays perfectly valid -
+that is what `ca_file` is for.
+
 ### When the capability check cannot conclude
 
 Two refusals, deliberately worded apart:

@@ -92,7 +92,11 @@ ca_file = <path>
   verification anchored somewhere nobody chose is worse than a loud refusal.
 * A path set here, or declared in sslRootCAPath, that cannot be resolved at
   all is refused rather than resolved: a value written against $SPLUNK_HOME
-  while the search process has no $SPLUNK_HOME in its environment, and a value
-  that expands to an empty path. Give an absolute path in that case.
+  while the search process has no $SPLUNK_HOME in its environment, a value
+  that expands to an empty path, and a relative value whose .. segments climb
+  above $SPLUNK_HOME. Give an absolute path in those cases.
+* Paths are normalised segment by segment - ., .. and doubled separators are
+  resolved as the file system resolves them. Percent sequences are NOT
+  decoded: %2F is a character of a file name, never a separator.
 * Ignored when verify_ssl is false.
 * Default: empty
