@@ -809,7 +809,11 @@ class FailureTaxonomyTest(RestTestCase):
             urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
         )
         self.assertEqual(failure.kind, rest.FAILURE_NETWORK)
-        self.assertIn("Connection refused", failure.message)
+        # The label of the class of cause, not the platform's own sentence -
+        # `NetworkReasonWordingTest` below is where that rule is enforced.
+        self.assertIn(
+            rest.NETWORK_REASONS["ConnectionRefusedError"], failure.message
+        )
 
     def test_a_malformed_json_answer_is_unreadable(self):
         self.use_context_factory(_ContextFactory())
@@ -841,6 +845,114 @@ class FailureTaxonomyTest(RestTestCase):
             rest.FAILURE_NETWORK,
         ]
         self.assertEqual(len(set(kinds)), len(kinds))
+
+
+class NetworkReasonWordingTest(RestTestCase):
+    """CH-4.12: a message names the CLASS of cause, never the raw exception.
+
+    `NETWORK_MESSAGE % str(exception)` used to render the platform's own text
+    verbatim - `[WinError 3] Le chemin d'acces specifie est introuvable` on a
+    French Windows, something else on the next release, something else again
+    on Linux. Three defects in one string: it is localised, it is unstable,
+    and it is free to quote a host or a path the message never meant to name.
+    """
+
+    #: Stands in for anything an operating system might write. If it ever
+    #: reaches a message, the raw exception reached the user with it.
+    PLATFORM_SENTINEL = "PLATFORM_TEXT_SENTINEL_9c1d /var/secret/path"
+
+    def _message(self, raises):
+        self.use_context_factory(_ContextFactory())
+        self.use_urlopen(_Urlopen(raises=raises))
+        _, failure = self.client().get_capabilities()
+        self.assertEqual(failure.kind, rest.FAILURE_NETWORK)
+        return failure.message
+
+    def test_no_platform_text_reaches_the_message(self):
+        shapes = (
+            urllib.error.URLError(OSError(3, self.PLATFORM_SENTINEL)),
+            urllib.error.URLError(
+                ConnectionRefusedError(111, self.PLATFORM_SENTINEL)
+            ),
+            urllib.error.URLError(self.PLATFORM_SENTINEL),
+            OSError(5, self.PLATFORM_SENTINEL),
+            RuntimeError(self.PLATFORM_SENTINEL),
+        )
+        for shape in shapes:
+            with self.subTest(shape=type(shape).__name__):
+                # Calibration (CH-10.2, CH-10.3): the probe must have
+                # something to find before its absence proves anything.
+                self.assertIn(self.PLATFORM_SENTINEL, str(shape))
+                message = self._message(shape)
+                self.assertNotIn(self.PLATFORM_SENTINEL, message)
+                self.assertNotIn("PLATFORM_TEXT_SENTINEL", message)
+
+    def test_each_named_class_gets_its_own_stable_label(self):
+        cases = (
+            (ConnectionRefusedError(111, "refused"), "ConnectionRefusedError"),
+            (ConnectionResetError(104, "reset"), "ConnectionResetError"),
+            (ConnectionAbortedError(103, "aborted"), "ConnectionAbortedError"),
+            (BrokenPipeError(32, "broken pipe"), "BrokenPipeError"),
+            (PermissionError(13, "denied"), "PermissionError"),
+        )
+        for cause, key in cases:
+            for shape in (cause, urllib.error.URLError(cause)):
+                with self.subTest(cause=key, wrapped=shape is not cause):
+                    self.assertEqual(
+                        self._message(shape),
+                        rest.NETWORK_MESSAGE % rest.NETWORK_REASONS[key],
+                    )
+
+    def test_the_socket_resolution_shape_is_recognised_by_name(self):
+        """`socket.gaierror`, without importing `socket` - the layering rule
+        keeps it out of the package, and `_is_timeout` already reads a class
+        name for the same reason."""
+
+        class gaierror(OSError):  # noqa: N801 - the `socket` spelling
+            pass
+
+        message = self._message(urllib.error.URLError(gaierror(-2, "unknown")))
+        self.assertEqual(
+            message, rest.NETWORK_MESSAGE % rest.NETWORK_REASONS["gaierror"]
+        )
+
+    def test_an_unnamed_cause_falls_back_to_a_qualified_default(self):
+        """Not to the platform's text, and not to a class name either: an
+        unlisted cause is one the port has not qualified, and the message says
+        exactly that."""
+        for shape in (
+            OSError(5, "Input/output error"),
+            RuntimeError("something entirely unexpected"),
+            urllib.error.URLError(None),
+        ):
+            with self.subTest(shape=type(shape).__name__):
+                self.assertEqual(
+                    self._message(shape),
+                    rest.NETWORK_MESSAGE % rest.NETWORK_REASON_DEFAULT,
+                )
+
+    def test_no_message_of_the_module_carries_a_class_name(self):
+        """Family sweep (CH-10.4): every shape of `NoExceptionEscapesTest`,
+        checked against every exception class name it can produce. A class
+        name is stable, but it is still Python's vocabulary, not the
+        operator's."""
+        names = set()
+        checked = 0
+        for shape in NoExceptionEscapesTest.SHAPES:
+            names.add(type(shape).__name__)
+            reason = getattr(shape, "reason", None)
+            if reason is not None:
+                names.add(type(reason).__name__)
+        self.assertGreaterEqual(len(names), 5)
+        for shape in NoExceptionEscapesTest.SHAPES:
+            with self.subTest(shape=type(shape).__name__):
+                self.use_context_factory(_ContextFactory())
+                self.use_urlopen(_Urlopen(raises=shape))
+                _, failure = self.client().get_capabilities()
+                checked += 1
+                for name in names:
+                    self.assertNotIn(name, failure.message)
+        self.assertEqual(checked, len(NoExceptionEscapesTest.SHAPES))
 
 
 class NoExceptionEscapesTest(RestTestCase):

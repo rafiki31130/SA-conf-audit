@@ -166,6 +166,32 @@ HTTP_MESSAGE = "splunkd answered HTTP %s on %s"
 
 NETWORK_MESSAGE = "the splunkd endpoint could not be reached (%s)"
 
+#: Network cause -> stable label, keyed by the exception CLASS name (CH-4.12).
+#: The platform's own text never reaches the operator: `[WinError 3] Le chemin
+#: d'acces specifie est introuvable` is localised, it changes between releases
+#: of the runtime, and it can quote a host or a path the message was never
+#: meant to disclose. A class name is a Python identifier - stable and
+#: translated nowhere - and this table is the single place that turns one into
+#: a sentence an operator can act on.
+NETWORK_REASONS = {
+    "ConnectionRefusedError": "the endpoint refused the connection",
+    "ConnectionResetError": "the endpoint reset the connection",
+    "ConnectionAbortedError": "the connection was aborted",
+    "BrokenPipeError": "the connection was closed mid-exchange",
+    #: `socket.gaierror` / `socket.herror`, by name: `socket` is kept out of
+    #: the package by the layering rule, exactly as `_is_timeout` does.
+    "gaierror": "the host of the splunkd address could not be resolved",
+    "herror": "the host of the splunkd address could not be resolved",
+    "PermissionError": "the operating system refused the outgoing connection",
+    "ValueError": "the splunkd address is not a usable URL",
+}
+
+#: Every cause the table does not name. It deliberately says nothing about the
+#: platform: an unlisted cause is one we have not qualified, and saying so is
+#: more honest - and more actionable - than quoting a sentence written by the
+#: operating system.
+NETWORK_REASON_DEFAULT = "no connection to the endpoint could be established"
+
 
 def read_ssl_root_ca_path(default_data, local_data):
     """`server.conf [sslConfig] sslRootCAPath`, `local` winning over `default`.
@@ -394,11 +420,27 @@ def _is_timeout(exc):
     return isinstance(exc, TimeoutError) or type(exc).__name__ == "timeout"
 
 
-def _reason_text(reason):
-    if reason is None:
-        return "no reason reported"
-    text = str(reason).strip()
-    return text or type(reason).__name__
+def _reason_label(exc, reason):
+    """The stable label of one network cause (CH-4.12).
+
+    Looked up on the CLASS of the exception, never on its text, and on the
+    WRAPPED one first: `urlopen` hands back a `URLError` whose `reason`
+    carries the cause that actually happened.
+
+    What this replaces is `str(exception)`, rendered verbatim. That string is
+    written by the C library and the operating system - `[WinError 3] Le
+    chemin d'acces specifie est introuvable` is a real answer of this code
+    path - so it is localised, unstable across runtimes, and free to quote a
+    path or a host. The charter forbids passing a raw Python exception through
+    to the user for all three reasons at once.
+    """
+    for item in (reason, exc):
+        if item is None:
+            continue
+        label = NETWORK_REASONS.get(type(item).__name__)
+        if label is not None:
+            return label
+    return NETWORK_REASON_DEFAULT
 
 
 class RestClient:
@@ -526,12 +568,11 @@ class RestClient:
         if isinstance(exc, ValueError):
             # `json.JSONDecodeError` and `UnicodeDecodeError` both land here.
             return RestFailure(FAILURE_UNREADABLE, UNREADABLE_MESSAGE % path)
-        if isinstance(exc, urllib.error.URLError):
-            return RestFailure(
-                FAILURE_NETWORK, NETWORK_MESSAGE % _reason_text(reason)
-            )
+        # Everything left - a `URLError` and anything the port never predicted
+        # alike - is a failed exchange named by its CLASS of cause, through
+        # the one table that holds the wording.
         return RestFailure(
-            FAILURE_NETWORK, NETWORK_MESSAGE % type(exc).__name__
+            FAILURE_NETWORK, NETWORK_MESSAGE % _reason_label(exc, reason)
         )
 
     # -- RestPort -------------------------------------------------------- #
