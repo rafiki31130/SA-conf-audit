@@ -12,9 +12,9 @@ value in any row), upstream pruning, member field.
 import unittest
 
 import tests  # noqa: F401  - inserts bin/ into sys.path before confaudit imports
-from confaudit import pipeline
+from confaudit import pipeline, rest
 from confaudit.errors import FatalBtoolError, FatalCapabilityError, FatalUsageError
-from confaudit.model import BtoolResult
+from confaudit.model import BtoolResult, RestFailure
 from confaudit.secrets import hash_value
 from tests.helpers import (
     FakeBtool,
@@ -67,6 +67,92 @@ class CapabilityTest(unittest.TestCase):
             _run(fs, btool, rest=FakeRest(capabilities=frozenset()))
         self.assertEqual(fs.read_paths, [])
         self.assertEqual(btool.calls, [])
+
+    def test_an_impossible_check_is_refused_before_any_etc_read_too(self):
+        """Fail-closed is unchanged: naming the cause does not soften it."""
+        fs, btool, _ = _simple_fixture()
+        with self.assertRaises(FatalCapabilityError):
+            _run(fs, btool, rest=FakeRest(
+                capabilities=None,
+                failure=RestFailure(rest.FAILURE_TLS, "TLS verification failed"),
+            ))
+        self.assertEqual(fs.read_paths, [])
+        self.assertEqual(btool.calls, [])
+
+
+class CapabilityCheckFailureTest(unittest.TestCase):
+    """Two outcomes, two messages, two branches.
+
+    Until 1.4.0 a TLS failure, a 401, a timeout and a malformed answer all
+    emitted the message about rights. That is what sent a production
+    diagnosis hours down the wrong track: the message accused the only thing
+    that was not at fault.
+    """
+
+    def _refusal(self, failure):
+        fs, btool, _ = _simple_fixture()
+        with self.assertRaises(FatalCapabilityError) as ctx:
+            _run(fs, btool, rest=FakeRest(capabilities=None, failure=failure))
+        return str(ctx.exception)
+
+    def test_an_impossible_check_does_not_emit_the_rights_message(self):
+        message = self._refusal(
+            RestFailure(rest.FAILURE_TLS, "TLS verification failed")
+        )
+        self.assertNotEqual(message, pipeline.CAPABILITY_MESSAGE)
+        self.assertNotIn("authorize.conf", message)
+
+    def test_the_two_messages_are_produced_by_two_distinct_paths(self):
+        """The point of the whole fix, asserted as such."""
+        fs, btool, _ = _simple_fixture()
+        with self.assertRaises(FatalCapabilityError) as absent:
+            _run(fs, btool, rest=FakeRest(capabilities=frozenset(("search",))))
+        with self.assertRaises(FatalCapabilityError) as impossible:
+            _run(fs, btool, rest=FakeRest(
+                capabilities=None,
+                failure=RestFailure(rest.FAILURE_TLS, "TLS verification failed"),
+            ))
+        self.assertNotEqual(str(absent.exception), str(impossible.exception))
+        self.assertEqual(str(absent.exception), pipeline.CAPABILITY_MESSAGE)
+
+    def test_the_exact_message_of_an_impossible_check(self):
+        self.assertEqual(
+            self._refusal(RestFailure(rest.FAILURE_TIMEOUT, "splunkd did not answer")),
+            "confbtool: the run_confbtool capability could not be verified, "
+            "so the command refuses to run - an impossible check never "
+            "presumes the authorization. Cause: splunkd did not answer.",
+        )
+
+    def test_the_reason_reported_by_the_port_reaches_the_message(self):
+        """Every nature of failure travels intact - the pipeline relays what
+        the adapter measured, it never re-guesses it."""
+        for kind, reason in (
+            (rest.FAILURE_TLS,
+             rest.TLS_MESSAGE % ("/opt/splunk/etc/auth/corp-root-ca.pem",
+                                 rest.CA_SOURCE_SERVER_CONF)),
+            (rest.FAILURE_AUTH, rest.AUTH_MESSAGE % 401),
+            (rest.FAILURE_TIMEOUT, rest.TIMEOUT_MESSAGE % 30),
+            (rest.FAILURE_UNREADABLE,
+             rest.UNREADABLE_MESSAGE % rest.CURRENT_CONTEXT_PATH),
+        ):
+            with self.subTest(kind=kind):
+                self.assertIn(reason, self._refusal(RestFailure(kind, reason)))
+
+    def test_the_tls_reason_names_the_ca_file_that_was_used(self):
+        """The acceptance criterion of the fix: an operator reads the refusal
+        and knows which store the chain was checked against."""
+        message = self._refusal(RestFailure(
+            rest.FAILURE_TLS,
+            rest.TLS_MESSAGE % ("/opt/splunk/etc/auth/corp-root-ca.pem",
+                                rest.CA_SOURCE_SERVER_CONF),
+        ))
+        self.assertIn("TLS", message)
+        self.assertIn("/opt/splunk/etc/auth/corp-root-ca.pem", message)
+        self.assertIn("sslRootCAPath", message)
+
+    def test_a_port_that_reports_nothing_still_refuses_and_says_so(self):
+        message = self._refusal(None)
+        self.assertIn(pipeline.UNQUALIFIED_FAILURE, message)
 
 
 class BtoolFailureTest(unittest.TestCase):
