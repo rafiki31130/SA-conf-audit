@@ -28,12 +28,36 @@ from .secrets import (
     hash_value,
 )
 
-#: Exact rejection message of the capability check (spec section 10).
+#: Exact rejection message when the capability is ABSENT (spec section 10):
+#: the check ran, the answer was read, and the right is not there.
 CAPABILITY_MESSAGE = (
     "confbtool: the run_confbtool capability is required to run this command. "
     "The app grants it to the admin role by default; any other role needs an "
     "explicit grant (authorize.conf) by a Splunk administrator."
 )
+
+#: Exact rejection message when the check itself COULD NOT BE COMPLETED.
+#:
+#: A distinct message on purpose. Until 1.4.0 both outcomes emitted
+#: `CAPABILITY_MESSAGE`, which only ever accused the rights: a TLS failure, a
+#: 401, a timeout and an unreadable answer all read as "you lack the
+#: capability". That cost hours of production diagnosis on the wrong track,
+#: while the actual cause - a splunkd certificate signed by an enterprise CA,
+#: against a truststore that did not carry it - was never named.
+#:
+#: The fail-closed decision is unchanged: an impossible check never presumes
+#: the authorization. What changes is that the refusal now SAYS WHY, and the
+#: reason is supplied by the port (`RestFailure.message`), not guessed here.
+CAPABILITY_CHECK_MESSAGE = (
+    "confbtool: the run_confbtool capability could not be verified, so the "
+    "command refuses to run - an impossible check never presumes the "
+    "authorization. Cause: %s."
+)
+
+#: Reason of last resort: a RestPort that reports no capability and no failure
+#: either. Not reachable through `rest.py`, which always qualifies; it keeps
+#: the pipeline honest against any other implementation of the port.
+UNQUALIFIED_FAILURE = "the capability check returned neither an answer nor a reason"
 
 #: Exact message of a btool invocation failure (spec section 6.2, D-13).
 BTOOL_FAILED_MESSAGE = (
@@ -85,6 +109,7 @@ def load_settings(default_data, local_data):
     excluded_confs = values.get(("secrets", "pattern_excluded_confs"))
     level = values.get(("logging", "level"))
     verify = values.get(("rest", "verify_ssl"))
+    ca_file = values.get(("rest", "ca_file"))
     return AppSettings(
         extra_key_patterns=(
             parse_pattern_list(key_patterns) if key_patterns is not None
@@ -103,6 +128,7 @@ def load_settings(default_data, local_data):
             _parse_bool(verify, defaults.verify_ssl) if verify is not None
             else defaults.verify_ssl
         ),
+        ca_file=(ca_file or defaults.ca_file).strip(),
     )
 
 
@@ -117,7 +143,7 @@ def _parse_bool(raw, default):
 
 def run(fs, btool, rest, fieldnames, stanza=None, key=None, app=None,
         audit=False, debug=False, settings=None, member="", etc_prefix="",
-        log=None, emit=None):
+        log=None, emit=None, on_authorized=None):
     """Execute the whole flow of spec section 1.2; return the ordered rows.
 
     Raises `FatalCapabilityError`, `FatalUsageError`, `FatalBtoolError` or
@@ -127,15 +153,43 @@ def run(fs, btool, rest, fieldnames, stanza=None, key=None, app=None,
     When `emit` is given, each row is passed to it in emission order and the
     return value is the row count; otherwise the list of rows is returned. In
     both cases no row is built before the volume guard has passed.
+
+    `on_authorized` is the hook the WRAPPER uses to hold its own startup
+    diagnostics back until the capability has been established (CH-4.15). It
+    is called once, after the check has concluded in the affirmative, and on
+    no other path: neither refusal reaches it. The wrapper cannot do this
+    ordering by itself, since the check that gates it lives here.
     """
     log = log if log is not None else NullLog()
     settings = settings if settings is not None else AppSettings()
 
     # 1. Capability, before any reading of etc/ (spec section 10). An
-    # impossible check (REST failure) never presumes the authorization.
-    capabilities = rest.get_capabilities()
-    if capabilities is None or CAPABILITY not in capabilities:
+    # impossible check (REST failure) never presumes the authorization - but
+    # it is REFUSED UNDER ITS OWN MESSAGE, which names the cause the port
+    # reported. Two outcomes, two messages, two branches: the absence of a
+    # right and the impossibility of checking it are not the same event and
+    # must not read as one.
+    capabilities, failure = rest.get_capabilities()
+    if capabilities is None:
+        reason = failure.message if failure is not None else UNQUALIFIED_FAILURE
+        log.error(
+            "capability check failed (%s)"
+            % (failure.kind if failure is not None else "unqualified")
+        )
+        raise FatalCapabilityError(CAPABILITY_CHECK_MESSAGE % reason)
+    if CAPABILITY not in capabilities:
+        log.error("capability check refused: %s is absent" % CAPABILITY)
         raise FatalCapabilityError(CAPABILITY_MESSAGE)
+
+    # 1 bis. The capability is established - and only now may anything be
+    # emitted (CH-4.15). The wrapper's own startup diagnostics name the CA
+    # store it resolved, which is an infrastructure path; emitted before this
+    # point, they taught it to an operator the very next branch was about to
+    # refuse. Neither refusal above reaches this line, and that is deliberate:
+    # the fatal message of an impossible check already names the store and its
+    # source, so nothing diagnosable is lost.
+    if on_authorized is not None:
+        on_authorized()
 
     # 2. Parameters (spec section 7.1).
     params = filters.validate_params(

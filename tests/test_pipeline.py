@@ -12,11 +12,12 @@ value in any row), upstream pruning, member field.
 import unittest
 
 import tests  # noqa: F401  - inserts bin/ into sys.path before confaudit imports
-from confaudit import pipeline
+from confaudit import pipeline, rest
 from confaudit.errors import FatalBtoolError, FatalCapabilityError, FatalUsageError
-from confaudit.model import BtoolResult
+from confaudit.model import BtoolResult, CaResolution, RestFailure
 from confaudit.secrets import hash_value
 from tests.helpers import (
+    CollectingLog,
     FakeBtool,
     FakeFs,
     FakeRest,
@@ -24,6 +25,13 @@ from tests.helpers import (
 )
 
 ETC = "/opt/splunk/etc"
+
+#: A TLS failure as `rest.py` renders it once TWO stores are loaded - the
+#: nominal shape since the enterprise CA and the Splunk truststore cumulate.
+_TWO_STORES = (
+    "/opt/splunk/etc/auth/corp-root-ca.pem (from %s), "
+    "/opt/splunk/etc/auth/cacert.pem (from %s)"
+) % (rest.CA_SOURCE_SERVER_CONF, rest.CA_SOURCE_SPLUNK_DEFAULT)
 
 
 def _run(fs, btool, rest=None, **kwargs):
@@ -67,6 +75,93 @@ class CapabilityTest(unittest.TestCase):
             _run(fs, btool, rest=FakeRest(capabilities=frozenset()))
         self.assertEqual(fs.read_paths, [])
         self.assertEqual(btool.calls, [])
+
+    def test_an_impossible_check_is_refused_before_any_etc_read_too(self):
+        """Fail-closed is unchanged: naming the cause does not soften it."""
+        fs, btool, _ = _simple_fixture()
+        with self.assertRaises(FatalCapabilityError):
+            _run(fs, btool, rest=FakeRest(
+                capabilities=None,
+                failure=RestFailure(rest.FAILURE_TLS, "TLS verification failed"),
+            ))
+        self.assertEqual(fs.read_paths, [])
+        self.assertEqual(btool.calls, [])
+
+
+class CapabilityCheckFailureTest(unittest.TestCase):
+    """Two outcomes, two messages, two branches.
+
+    Until 1.4.0 a TLS failure, a 401, a timeout and a malformed answer all
+    emitted the message about rights. That is what sent a production
+    diagnosis hours down the wrong track: the message accused the only thing
+    that was not at fault.
+    """
+
+    def _refusal(self, failure):
+        fs, btool, _ = _simple_fixture()
+        with self.assertRaises(FatalCapabilityError) as ctx:
+            _run(fs, btool, rest=FakeRest(capabilities=None, failure=failure))
+        return str(ctx.exception)
+
+    def test_an_impossible_check_does_not_emit_the_rights_message(self):
+        message = self._refusal(
+            RestFailure(rest.FAILURE_TLS, "TLS verification failed")
+        )
+        self.assertNotEqual(message, pipeline.CAPABILITY_MESSAGE)
+        self.assertNotIn("authorize.conf", message)
+
+    def test_the_two_messages_are_produced_by_two_distinct_paths(self):
+        """The point of the whole fix, asserted as such."""
+        fs, btool, _ = _simple_fixture()
+        with self.assertRaises(FatalCapabilityError) as absent:
+            _run(fs, btool, rest=FakeRest(capabilities=frozenset(("search",))))
+        with self.assertRaises(FatalCapabilityError) as impossible:
+            _run(fs, btool, rest=FakeRest(
+                capabilities=None,
+                failure=RestFailure(rest.FAILURE_TLS, "TLS verification failed"),
+            ))
+        self.assertNotEqual(str(absent.exception), str(impossible.exception))
+        self.assertEqual(str(absent.exception), pipeline.CAPABILITY_MESSAGE)
+
+    def test_the_exact_message_of_an_impossible_check(self):
+        self.assertEqual(
+            self._refusal(RestFailure(rest.FAILURE_TIMEOUT, "splunkd did not answer")),
+            "confbtool: the run_confbtool capability could not be verified, "
+            "so the command refuses to run - an impossible check never "
+            "presumes the authorization. Cause: splunkd did not answer.",
+        )
+
+    def test_the_reason_reported_by_the_port_reaches_the_message(self):
+        """Every nature of failure travels intact - the pipeline relays what
+        the adapter measured, it never re-guesses it."""
+        for kind, reason in (
+            (rest.FAILURE_TLS, rest.TLS_MESSAGE % _TWO_STORES),
+            (rest.FAILURE_AUTH, rest.AUTH_MESSAGE % 401),
+            (rest.FAILURE_TIMEOUT, rest.TIMEOUT_MESSAGE % 30),
+            (rest.FAILURE_UNREADABLE,
+             rest.UNREADABLE_MESSAGE % rest.CURRENT_CONTEXT_PATH),
+        ):
+            with self.subTest(kind=kind):
+                self.assertIn(reason, self._refusal(RestFailure(kind, reason)))
+
+    def test_the_tls_reason_names_every_ca_file_that_was_used(self):
+        """The acceptance criterion of the fix: an operator reads the refusal
+        and knows which stores the chain was checked against - ALL of them.
+
+        Since the stores cumulate, naming one would leave the reader guessing
+        whether the other was in play, and which of the two to go and fix.
+        """
+        message = self._refusal(
+            RestFailure(rest.FAILURE_TLS, rest.TLS_MESSAGE % _TWO_STORES)
+        )
+        self.assertIn("TLS", message)
+        self.assertIn("/opt/splunk/etc/auth/corp-root-ca.pem", message)
+        self.assertIn("sslRootCAPath", message)
+        self.assertIn("/opt/splunk/etc/auth/cacert.pem", message)
+
+    def test_a_port_that_reports_nothing_still_refuses_and_says_so(self):
+        message = self._refusal(None)
+        self.assertIn(pipeline.UNQUALIFIED_FAILURE, message)
 
 
 class BtoolFailureTest(unittest.TestCase):
@@ -431,6 +526,158 @@ class NoEventFieldsTest(unittest.TestCase):
         self.assertNotIn("$7$cipher_text", blob)
         self.assertIn(hash_value("$7$cipher_text"), blob)
         self.assertNotIn(path, blob)   # debug=false withholds the path
+
+
+class EmissionOrderTest(unittest.TestCase):
+    """CH-4.15: the capability check precedes every emission of the command.
+
+    The wrapper's startup diagnostics NAME the resolved CA store, which is an
+    infrastructure path. Emitted where 1.4.0 put them - ahead of the call to
+    `pipeline.run` - an operator without `run_confbtool` learned that path and
+    was refused immediately after. The check lives here, so the hook that
+    releases them lives here too.
+    """
+
+    def _events(self, rest_port):
+        events = []
+        fs, btool, _ = _simple_fixture()
+        try:
+            _run(fs, btool, rest=rest_port,
+                 on_authorized=lambda: events.append("emitted"))
+        except FatalCapabilityError:
+            events.append("refused")
+        return events
+
+    def test_nothing_is_emitted_when_the_right_is_absent(self):
+        self.assertEqual(
+            self._events(FakeRest(capabilities=frozenset(("search",)))),
+            ["refused"],
+        )
+
+    def test_nothing_is_emitted_when_the_check_cannot_conclude(self):
+        """Every shape of an impossible check, not just the reported one."""
+        failures = (
+            RestFailure(rest.FAILURE_TLS, "TLS verification failed"),
+            RestFailure(rest.FAILURE_CA_FILE, "the store is unusable"),
+            RestFailure(rest.FAILURE_AUTH, "authentication refused"),
+            RestFailure(rest.FAILURE_TIMEOUT, "no answer"),
+            RestFailure(rest.FAILURE_NETWORK, "unreachable"),
+            None,
+        )
+        for failure in failures:
+            with self.subTest(failure=failure.kind if failure else None):
+                self.assertEqual(
+                    self._events(FakeRest(capabilities=None, failure=failure)),
+                    ["refused"],
+                )
+
+    def test_the_hook_fires_once_when_the_right_is_there(self):
+        """Calibration (CH-10.2): the refusals above prove something only
+        because the hook does fire when it should."""
+        self.assertEqual(self._events(FakeRest()), ["emitted"])
+
+    def test_the_hook_fires_before_the_run_it_describes(self):
+        """A release valve, not a postscript: deferring the diagnostics behind
+        the check must not push them behind the work they announce."""
+        fs, btool, _ = _simple_fixture()
+        seen = {}
+        _run(fs, btool, on_authorized=lambda: seen.update(
+            reads=list(fs.read_paths), calls=list(btool.calls),
+        ))
+        self.assertEqual(seen, {"reads": [], "calls": []})
+        # CH-10.3: the two empty lists are read on instruments that do fill up.
+        self.assertTrue(fs.read_paths)
+        self.assertTrue(btool.calls)
+
+
+class WrapperEmissionOrderTest(unittest.TestCase):
+    """The same rule, asserted on the wrapper that actually emits.
+
+    Behavioural rather than structural: a run refused for want of the right
+    must not have shown the CA store path to anyone - not in a warning, not in
+    the app log.
+    """
+
+    CA = CaResolution(
+        "/opt/splunk/etc/auth/corp-root-ca.pem",
+        "server.conf [sslConfig] sslRootCAPath",
+        False,
+    )
+
+    def _patch(self, target, name, value):
+        original = getattr(target, name)
+        setattr(target, name, value)
+        self.addCleanup(setattr, target, name, original)
+
+    def _command(self, run_stub):
+        import confbtool
+
+        searchinfo = type("_SearchInfo", (), {
+            "session_key": "SESSION_KEY_SENTINEL",
+            "splunkd_uri": "https://127.0.0.1:8089",
+        })()
+
+        command = confbtool.ConfBtoolCommand()
+        command._protocol_version = 2
+        command.fieldnames = ["probe"]
+        command._metadata = type("_Metadata", (), {"searchinfo": searchinfo})()
+
+        warnings = []
+        command.write_warning = warnings.append
+        log = CollectingLog()
+
+        self._patch(confbtool, "open_app_log", lambda *a, **k: log)
+        self._patch(confbtool, "read_system_conf_bytes",
+                    lambda *a, **k: (None, None))
+        self._patch(confbtool, "resolve_ca_file", lambda *a, **k: self.CA)
+        self._patch(confbtool, "RestClient", lambda *a, **k: FakeRest())
+        self._patch(confbtool.pipeline, "run", run_stub)
+        return command, warnings, log
+
+    def _emitted(self, run_stub):
+        command, warnings, log = self._command(run_stub)
+        try:
+            command._run()
+        except FatalCapabilityError:
+            pass
+        return warnings + [message for _, message in log.messages]
+
+    def test_a_refused_run_never_names_the_ca_store(self):
+        """What the defect cost: a path handed to someone about to be told
+        they have no right to be here."""
+        def refuse(**kwargs):
+            raise FatalCapabilityError(pipeline.CAPABILITY_MESSAGE)
+
+        emitted = self._emitted(refuse)
+        for message in emitted:
+            self.assertNotIn(self.CA.path, message)
+            self.assertNotIn(self.CA.source, message)
+
+    def test_an_authorized_run_does_name_it(self):
+        """Calibration (CH-10.2): the absence above is only meaningful because
+        the diagnostics exist and do come out once the check has passed."""
+        def authorize(**kwargs):
+            kwargs["on_authorized"]()
+            return []
+
+        emitted = self._emitted(authorize)
+        self.assertTrue(
+            [message for message in emitted if self.CA.path in message],
+            "the deferred diagnostics never came out at all",
+        )
+
+    def test_the_wrapper_hands_the_pipeline_its_hook(self):
+        """The deferral is wiring, and wiring is what the wrapper is for."""
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return []
+
+        command, _, _ = self._command(capture)
+        command._run()
+        self.assertIn("on_authorized", captured)
+        self.assertTrue(callable(captured["on_authorized"]))
 
 
 class CommandMetadataTest(unittest.TestCase):

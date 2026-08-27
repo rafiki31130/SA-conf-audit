@@ -45,8 +45,16 @@ from confaudit import pipeline  # noqa: E402
 from confaudit.applog import open_app_log  # noqa: E402
 from confaudit.btoolrun import BtoolRunner  # noqa: E402
 from confaudit.errors import FatalError  # noqa: E402
-from confaudit.layers import LocalFileSystem, read_app_conf_bytes  # noqa: E402
-from confaudit.rest import RestClient  # noqa: E402
+from confaudit.layers import (  # noqa: E402
+    LocalFileSystem,
+    read_app_conf_bytes,
+    read_system_conf_bytes,
+)
+from confaudit.rest import (  # noqa: E402
+    RestClient,
+    read_ssl_root_ca_path,
+    resolve_ca_file,
+)
 
 _APP_ROOT = os.path.dirname(_BIN)
 
@@ -161,11 +169,41 @@ class ConfBtoolCommand(GeneratingCommand):
                 "continues without a log file."
             )
 
-        ca_file = None
-        if settings.verify_ssl and splunk_home:
-            candidate = os.path.join(splunk_home, "etc", "auth", "cacert.pem")
-            if os.path.exists(candidate):
-                ca_file = candidate
+        # CA store of the splunkd verification: `[rest] ca_file`, else the
+        # instance's own `server.conf [sslConfig] sslRootCAPath`, else the
+        # Splunk truststore. The rule itself lives in `confaudit.rest`; the
+        # wrapper only supplies the bytes and the disk predicate.
+        server_default, server_local = read_system_conf_bytes(
+            splunk_home, "server"
+        )
+        ca = resolve_ca_file(
+            settings.ca_file,
+            read_ssl_root_ca_path(server_default, server_local),
+            splunk_home,
+            os.path.isfile,
+        )
+        # Both diagnostics below NAME the resolved CA store, which is an
+        # infrastructure path. CH-4.15 requires the capability check to precede
+        # every emission, and that check lives inside `pipeline.run`; emitted
+        # here they reached an operator the pipeline was about to refuse for
+        # lack of the right. They are deferred to `on_authorized`, which the
+        # pipeline calls once the capability is established and on no refusal
+        # path. Nothing diagnosable is lost when the check fails on the store
+        # itself: the fatal message already names the store and its source.
+        def _ca_store_diagnostics():
+            if log is not None:
+                log.info(
+                    "ca store: %s (from %s, present=%s)" % (
+                        ca.path or "-", ca.source, str(ca.exists).lower(),
+                    )
+                )
+            if settings.verify_ssl and ca.path and not ca.exists:
+                self.write_warning(
+                    "confbtool: the CA store %s, resolved from %s, was not "
+                    "found; the splunkd capability check cannot succeed until "
+                    "that path is fixed." % (ca.path, ca.source)
+                )
+
         if not settings.verify_ssl:
             self.write_warning(
                 "confbtool: verify_ssl=false: verification of the splunkd "
@@ -174,7 +212,7 @@ class ConfBtoolCommand(GeneratingCommand):
 
         rest = RestClient(
             splunkd_uri, session_key,
-            verify_ssl=settings.verify_ssl, ca_file=ca_file,
+            verify_ssl=settings.verify_ssl, ca=ca,
         )
         member = rest.get_server_name() or socket.gethostname()
         file_system = LocalFileSystem(splunk_home)
@@ -193,6 +231,7 @@ class ConfBtoolCommand(GeneratingCommand):
             member=member,
             etc_prefix=file_system.etc_root,
             log=log,
+            on_authorized=_ca_store_diagnostics,
         )
 
 

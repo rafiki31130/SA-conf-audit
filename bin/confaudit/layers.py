@@ -140,3 +140,28 @@ def read_app_conf_bytes(app_root):
         except OSError:
             out.append(None)
     return tuple(out)
+
+
+def read_system_conf_bytes(splunk_home, conf):
+    """Bytes of the two SYSTEM layers of `<conf>.conf`: `(default, local)`.
+
+    Used for `server.conf [sslConfig] sslRootCAPath`, the instance's own
+    declaration of its TLS trust anchor (`rest.read_ssl_root_ca_path`). Only
+    `etc/system/{default,local}` is read, on purpose: `sslRootCAPath` governs
+    splunkd itself, and no app layer is expected to carry it.
+
+    Contrast with `LocalFileSystem.list_layer_files`, which enumerates the
+    four btool layers because it feeds the AUDIT. This reads one internal
+    setting; it is not audit output, so an absent or unreadable layer comes
+    back as `None` rather than as a `parse_error` row.
+    """
+    etc_root = os.path.join(splunk_home or "", "etc")
+    out = []
+    for layer in ("default", "local"):
+        path = os.path.join(etc_root, "system", layer, conf + ".conf")
+        try:
+            with open(path, "rb") as handle:
+                out.append(handle.read())
+        except OSError:
+            out.append(None)
+    return tuple(out)

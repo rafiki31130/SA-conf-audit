@@ -67,15 +67,22 @@ class FakeBtool:
 
 
 class FakeRest:
-    """RestPort with a fixed capability set and server name."""
+    """RestPort with a fixed capability set, failure and server name.
+
+    `get_capabilities` returns the `(capabilities, failure)` pair of the port
+    (spec section 1.4): `capabilities=None` with `failure=None` models a port
+    that reports nothing at all, `failure=RestFailure(...)` a check that could
+    not be completed and says why.
+    """
 
     def __init__(self, capabilities=frozenset(("run_confbtool",)),
-                 server_name="member-01"):
+                 server_name="member-01", failure=None):
         self.capabilities = capabilities
         self.server_name = server_name
+        self.failure = failure
 
     def get_capabilities(self):
-        return self.capabilities
+        return self.capabilities, self.failure
 
     def get_server_name(self):
         return self.server_name

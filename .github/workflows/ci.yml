@@ -84,19 +84,21 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Build the archive
         # EXACTLY the command of the release procedure, run on the same tree:
-        # the five roots of the deployable contract, explicitly listed, so the
+        # the six roots of the deployable contract, explicitly listed, so the
         # artifact of this job and the asset of a release built from the same
-        # commit are the same bytes.
+        # commit are the same bytes. `README/` is the DIRECTORY carrying
+        # `confbtool.conf.spec`, not the `README.md` file beside it: that is
+        # Splunk's naming, and the reason both appear in the list.
         run: |
           git archive --format=tar.gz --prefix=SA-conf-audit/ \
             -o "SA-conf-audit-${{ steps.version.outputs.version }}.spl" HEAD \
-            -- default bin metadata README.md LICENSE
+            -- default bin metadata README README.md LICENSE
       - name: Check the contents and publish the digest
         run: |
           spl="SA-conf-audit-${{ steps.version.outputs.version }}.spl"
           roots=$(tar -tzf "$spl" | awk -F/ 'NF>1 && $2 != "" {print $2}' | LC_ALL=C sort -u)
           echo "$roots"
-          expected=$'LICENSE\nREADME.md\nbin\ndefault\nmetadata'
+          expected=$'LICENSE\nREADME\nREADME.md\nbin\ndefault\nmetadata'
           test "$roots" = "$expected" || { echo "unexpected roots in the archive"; exit 1; }
           # Belt and braces: the repository's own service trees must not ship.
           ! tar -tzf "$spl" | grep -qE '/(tests|tools|\.github)/' || {
