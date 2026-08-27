@@ -79,17 +79,29 @@ verify_ssl = <boolean>
 ca_file = <path>
 * CA store the splunkd certificate chain is verified against. Explicit escape
   hatch, for the cases the resolution below does not cover.
+* When set, this store is EXCLUSIVE: it is the only one loaded, and neither
+  sslRootCAPath nor the Splunk truststore is added to it. An administrator who
+  names an exact set of authorities keeps it exact. This key is new in 1.4.0,
+  so its exclusivity cannot change how any earlier installation behaved.
 * $SPLUNK_HOME is expanded, and a relative path is anchored on $SPLUNK_HOME.
-* When empty, the store is resolved in this order:
+* When empty, the stores are CUMULATED, not ranked:
     1. server.conf [sslConfig] sslRootCAPath, read on etc/system/default then
        etc/system/local, local winning - what the instance itself declares as
        its trust anchor, and what makes a member whose splunkd certificate was
        replaced by an enterprise one work with no setting at all;
     2. $SPLUNK_HOME/etc/auth/cacert.pem, the Splunk truststore.
+  Both are loaded into the same verification context whenever both are
+  present. Loading a second store ADDS certificate authorities and removes
+  none, so the verification is never weakened: it is what lets a member that
+  kept its original splunkd certificate keep working on an instance whose
+  sslRootCAPath was filled for unrelated purposes.
 * A path set here, or declared in sslRootCAPath, is used even when it does not
   exist: the capability check then fails with a message naming that file and
-  the setting it came from. There is no silent fallback to another store - a
+  the setting it came from - even when the other store would have verified the
+  chain on its own. There is no silent fallback to the remaining store - a
   verification anchored somewhere nobody chose is worse than a loud refusal.
+  The Splunk truststore is not subject to this: nobody configures it, so its
+  absence is not a configuration error.
 * A path set here, or declared in sslRootCAPath, that cannot be resolved at
   all is refused rather than resolved: a value written against $SPLUNK_HOME
   while the search process has no $SPLUNK_HOME in its environment, a value
@@ -98,5 +110,7 @@ ca_file = <path>
 * Paths are normalised segment by segment - ., .. and doubled separators are
   resolved as the file system resolves them. Percent sequences are NOT
   decoded: %2F is a character of a file name, never a separator.
+* On a verification failure the message names every store that was loaded,
+  each with the setting it came from.
 * Ignored when verify_ssl is false.
 * Default: empty

@@ -412,29 +412,56 @@ ca_file =
 
 The command calls splunkd on the loopback interface to read the capabilities
 of the running user. With `verify_ssl = true` - the default - that call
-verifies the certificate chain, and the store it verifies against is
-**resolved**, strongest first:
+verifies the certificate chain, and the stores it verifies against are
+**resolved** as follows:
 
-| # | Source | When it applies |
-|---|---|---|
-| 1 | `[rest] ca_file` of `confbtool.conf` | Set and non-empty. The explicit escape hatch. |
-| 2 | `server.conf [sslConfig] sslRootCAPath` | Read on `etc/system/default` then `etc/system/local`, `local` winning. What the **instance itself** declares as its trust anchor. |
-| 3 | `$SPLUNK_HOME/etc/auth/cacert.pem` | Fallback: Splunk's own truststore. |
+| Case | Stores loaded |
+|---|---|
+| `[rest] ca_file` of `confbtool.conf` is set | **That store alone.** |
+| Otherwise | `server.conf [sslConfig] sslRootCAPath` **and** `$SPLUNK_HOME/etc/auth/cacert.pem`, **cumulated**, whenever both are present. |
+| Neither is configured | `$SPLUNK_HOME/etc/auth/cacert.pem` alone. |
 
-`$SPLUNK_HOME` is expanded and a relative path is anchored on it, in both
-sources 1 and 2.
+`sslRootCAPath` is read on `etc/system/default` then `etc/system/local`,
+`local` winning. `$SPLUNK_HOME` is expanded and a relative path is anchored on
+it, in `ca_file` as in `sslRootCAPath`.
 
-Source 2 is what makes the command work out of the box on a member whose
-splunkd certificate has been replaced by an enterprise one: the CA that signs
-it is declared right there, and up to 1.3.0 the app read only source 3 -
-which does not carry it, so every check failed. **Nothing needs to be
-configured for that case**; `ca_file` exists for whatever the first two do not
-cover.
+**The stores cumulate rather than exclude one another**, and that is not a
+loosening. `ssl` loads a second store through `load_verify_locations`, which
+*adds* certificate authorities to the verification context and removes none:
+a chain that verified against one store still verifies, and a chain that
+verified against neither still fails.
 
-A path coming from source 1 or 2 is used **even when it does not exist**. The
-check then fails with a message naming that file and the source it came from.
-There is no quiet fallback to another store: a verification anchored somewhere
-nobody chose is worse than a loud refusal.
+Cumulating is what makes both real configurations work at once:
+
+- a member whose splunkd certificate has been **replaced by an enterprise
+  one**: the CA that signs it is declared in `sslRootCAPath`, and up to 1.3.0
+  the app read only `cacert.pem` - which does not carry it, so every check
+  failed;
+- a member that **kept its original splunkd certificate** on an instance where
+  an administrator has filled `sslRootCAPath` for unrelated purposes. That one
+  verified fine in 1.3.0 against `cacert.pem`, and an exclusive precedence
+  would refuse it - the enterprise CA signed nothing here. Both authorities
+  are loaded, so both members verify.
+
+**Nothing needs to be configured for either case.**
+
+`[rest] ca_file` is the one exception, and it is **exclusive**: set it and it
+is the only store loaded, `cacert.pem` included. It is an explicit escape
+hatch, posted by an administrator who wants an exact set of authorities, and
+quietly adding others would take that control away. The key is new in 1.4.0,
+so nothing that predates it can be affected.
+
+A **declared** path - `ca_file`, or `sslRootCAPath` - is used **even when it
+does not exist**. The check then fails with a message naming that file and the
+source it came from, and it fails **even when the other store would have
+verified the chain on its own**. Cumulating widens what verifies; it never
+covers up a configuration error by quietly carrying on with the store that is
+left. A verification anchored somewhere nobody chose is worse than a loud
+refusal.
+
+`cacert.pem` is on the other side of that line: nobody configures it, so its
+absence is not a configuration error and the run carries on with the declared
+store alone.
 
 The command also emits a warning naming that store - but **only once the
 `run_confbtool` capability has been established**. A CA store path is
@@ -449,6 +476,10 @@ path. Both would otherwise re-anchor the verification silently - on the file
 system root, or on the platform's own trust store - while every message kept
 naming the setting. Once a store is **declared**, no value reaches the
 platform's default trust store.
+
+When the chain fails to verify, the message names **every store that was
+loaded**, each with the source it came from - one line to read, and no
+guessing whether one authority set was in play or two.
 
 Paths are normalised **segment by segment** - `.`, `..` and doubled separators
 resolved as the file system resolves them, percent sequences left alone
