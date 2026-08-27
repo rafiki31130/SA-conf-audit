@@ -93,25 +93,102 @@ class _Urlopen:
         return _Response(self.payload)
 
 
+#: Which authority each synthetic store carries. NAMES, never certificates:
+#: the charter forbids certificate material in a test as in a log (CH-9.4),
+#: and a name is all the trust decision below needs.
+STORE_AUTHORITIES = {
+    SPLUNK_CA: "splunk-default-ca",
+    ENTERPRISE_CA: "corp-root-ca",
+    OPERATOR_CA: "operator-ca",
+}
+
+
+class _RecordingContext(ssl.SSLContext):
+    """A real `SSLContext` that records every store loaded into it.
+
+    Real, so `check_hostname` and `verify_mode` stay the genuine attributes
+    the other tests assert on. `load_verify_locations` is overridden because
+    the real one wants a PEM on disk, and this tree carries none - and because
+    the property the cumulation rests on is precisely that this call ADDS
+    authorities to a context and removes none.
+    """
+
+    def __new__(cls, protocol=ssl.PROTOCOL_TLS_CLIENT):
+        context = super().__new__(cls, protocol)
+        context.loaded = []
+        context.authorities = set()
+        return context
+
+    def add_store(self, cafile):
+        self.loaded.append(cafile)
+        authority = STORE_AUTHORITIES.get(cafile)
+        if authority is not None:
+            self.authorities.add(authority)
+
+    def load_verify_locations(self, cafile=None, capath=None, cadata=None):
+        if self.load_raises is not None:
+            raise self.load_raises
+        self.add_store(cafile)
+
+
 class _ContextFactory:
     """Stand-in for `ssl.create_default_context`, recording its `cafile`.
 
     The tests carry no certificate material, so no real CA bundle can be
     loaded; everything downstream of the context - classification, messages,
     the header - is exercised for real. What this factory buys, beyond making
-    the client constructible, is the ability to assert WHICH store was handed
-    to `ssl`, which is the whole point of the fix.
+    the client constructible, is the ability to assert WHICH stores were
+    handed to `ssl` and in which order, which is the whole point of the fix.
+
+    `cafiles` records the store passed to `create_default_context` - the first
+    one, and under `[rest] ca_file` the only one. The stores cumulated after
+    it go through `load_verify_locations`, so they land in
+    `contexts[n].loaded`, never in `cafiles`: asserting on `cafiles` alone
+    would say nothing about the cumulation.
     """
 
-    def __init__(self, raises=None):
+    def __init__(self, raises=None, load_raises=None):
         self.cafiles = []
+        self.contexts = []
         self.raises = raises
+        self.load_raises = load_raises
 
     def __call__(self, cafile=None):
         self.cafiles.append(cafile)
         if self.raises is not None:
             raise self.raises
-        return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context = _RecordingContext()
+        context.load_raises = self.load_raises
+        context.add_store(cafile)
+        self.contexts.append(context)
+        return context
+
+
+class _TrustingUrlopen(_Urlopen):
+    """`urlopen` that answers only when the chain's signer is trusted.
+
+    Models the one property of `load_verify_locations` the whole fix rests on:
+    a chain verifies as soon as ONE loaded store carries the authority that
+    signed it. A "certificate" here is the NAME of that authority - no PEM, no
+    key, nothing the charter keeps out of a test tree (CH-9.4).
+    """
+
+    def __init__(self, signed_by, payload):
+        _Urlopen.__init__(self, payload=payload)
+        self.signed_by = signed_by
+
+    def __call__(self, request, timeout=None, context=None):
+        self.requests.append(request)
+        self.timeouts.append(timeout)
+        self.contexts.append(context)
+        if self.signed_by not in set(getattr(context, "authorities", ())):
+            raise urllib.error.URLError(
+                ssl.SSLCertVerificationError(
+                    1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify "
+                       "failed: unable to get local issuer certificate"
+                )
+            )
+        return _Response(self.payload)
 
 
 class RestTestCase(unittest.TestCase):
@@ -243,6 +320,188 @@ class CaPathExpansionTest(RestTestCase):
         resolution = rest.resolve_ca_file("", OPERATOR_CA, "", _present())
         self.assertEqual(resolution.path, OPERATOR_CA)
         self.assertFalse(resolution.exists)
+
+
+class CaCumulationTest(RestTestCase):
+    """The stores CUMULATE; only `[rest] ca_file` stays exclusive.
+
+    Exclusive precedence fixed one failure and created its mirror image. A
+    member that had kept its ORIGINAL splunkd certificate, on an instance
+    whose administrator had filled `sslRootCAPath` with an enterprise CA for
+    unrelated purposes, verified fine in 1.3.0 against `cacert.pem` and was
+    refused in 1.4.0 - the enterprise CA outranked the truststore and had
+    signed nothing at all. `load_verify_locations` adds authorities to a
+    context and removes none, so loading both stores serves both
+    configurations without ever verifying less than either would alone.
+
+    The trust decision is modelled, not performed: a certificate is the NAME
+    of the authority that signed it (CH-9.4 keeps certificate material out of
+    a test tree as firmly as out of a log).
+    """
+
+    def _wired(self, configured, declared, present, signed_by,
+               load_raises=None):
+        factory = self.use_context_factory(
+            _ContextFactory(load_raises=load_raises)
+        )
+        urlopen = self.use_urlopen(_TrustingUrlopen(
+            signed_by, json.dumps(CURRENT_CONTEXT).encode("utf-8")
+        ))
+        resolution = rest.resolve_ca_file(
+            configured, declared, SPLUNK_HOME, _present(*present)
+        )
+        return self.client(ca=resolution), factory, urlopen
+
+    # -- the three trust outcomes ---------------------------------------- #
+
+    def test_a_certificate_signed_by_the_declared_ca_is_accepted(self):
+        """The 1.4.0 case that had to keep working: an enterprise certificate
+        whose CA is declared in `server.conf`."""
+        client, factory, _ = self._wired(
+            "", ENTERPRISE_CA, (ENTERPRISE_CA, SPLUNK_CA), "corp-root-ca",
+        )
+        capabilities, failure = client.get_capabilities()
+        self.assertIsNone(failure)
+        self.assertIn("run_confbtool", capabilities)
+        self.assertEqual(factory.contexts[0].loaded, [ENTERPRISE_CA, SPLUNK_CA])
+
+    def test_the_original_certificate_survives_a_foreign_sslrootcapath(self):
+        """The regression this change exists to undo.
+
+        The splunkd certificate is the ORIGINAL one, signed by the authority
+        in `cacert.pem`; `sslRootCAPath` is filled with an enterprise CA that
+        signed nothing here. 1.3.0 verified. 1.4.0, with `sslRootCAPath`
+        outranking the truststore, refused. Cumulated, it verifies again.
+        """
+        client, factory, _ = self._wired(
+            "", ENTERPRISE_CA, (ENTERPRISE_CA, SPLUNK_CA), "splunk-default-ca",
+        )
+        capabilities, failure = client.get_capabilities()
+        self.assertIsNone(
+            failure, "the configuration that worked in 1.3.0 must work again"
+        )
+        self.assertIn("run_confbtool", capabilities)
+        self.assertEqual(factory.contexts[0].loaded, [ENTERPRISE_CA, SPLUNK_CA])
+
+    def test_a_certificate_signed_by_neither_store_is_refused(self):
+        """Cumulating widens trust; it does not abolish it."""
+        client, _, _ = self._wired(
+            "", ENTERPRISE_CA, (ENTERPRISE_CA, SPLUNK_CA), "an-unknown-ca",
+        )
+        capabilities, failure = client.get_capabilities()
+        self.assertIsNone(capabilities, "fail-closed")
+        self.assertEqual(failure.kind, rest.FAILURE_TLS)
+
+    # -- `[rest] ca_file` stays exclusive -------------------------------- #
+
+    def test_ca_file_is_the_only_store_loaded(self):
+        client, factory, _ = self._wired(
+            OPERATOR_CA, ENTERPRISE_CA,
+            (OPERATOR_CA, ENTERPRISE_CA, SPLUNK_CA), "operator-ca",
+        )
+        capabilities, failure = client.get_capabilities()
+        self.assertIsNone(failure)
+        self.assertIn("run_confbtool", capabilities)
+        self.assertEqual(factory.cafiles, [OPERATOR_CA])
+        self.assertEqual(factory.contexts[0].loaded, [OPERATOR_CA])
+
+    def test_ca_file_excludes_a_certificate_the_truststore_would_accept(self):
+        """What exclusivity MEANS, rather than what it looks like: with
+        `ca_file` set, a chain the Splunk truststore would have accepted is
+        refused. An administrator who names an exact set of authorities keeps
+        it exact."""
+        client, factory, _ = self._wired(
+            OPERATOR_CA, ENTERPRISE_CA,
+            (OPERATOR_CA, ENTERPRISE_CA, SPLUNK_CA), "splunk-default-ca",
+        )
+        capabilities, failure = client.get_capabilities()
+        self.assertIsNone(capabilities)
+        self.assertEqual(failure.kind, rest.FAILURE_TLS)
+        self.assertEqual(factory.contexts[0].loaded, [OPERATOR_CA])
+
+    # -- the cumulation never masks a configuration error ---------------- #
+
+    def test_a_declared_store_that_is_missing_still_fails_closed(self):
+        """A1 in another costume, and the trap of this whole change.
+
+        `sslRootCAPath` names a file that is not there, `cacert.pem` is - and
+        the chain WOULD have verified against `cacert.pem` alone. Carrying on
+        would be a silent fallback onto the remaining store. The run refuses,
+        names the broken path, and emits nothing.
+        """
+        client, factory, urlopen = self._wired(
+            "", ENTERPRISE_CA, (SPLUNK_CA,), "splunk-default-ca",
+        )
+        capabilities, failure = client.get_capabilities()
+        self.assertIsNone(capabilities)
+        self.assertEqual(failure.kind, rest.FAILURE_CA_FILE)
+        self.assertIn(ENTERPRISE_CA, failure.message)
+        self.assertEqual(factory.cafiles, [])
+        self.assertEqual(urlopen.requests, [])
+
+        # CH-10.3: the two zeros above are read on recorders that do record.
+        other, factory, urlopen = self._wired(
+            "", ENTERPRISE_CA, (ENTERPRISE_CA, SPLUNK_CA), "corp-root-ca",
+        )
+        other.get_capabilities()
+        self.assertEqual(factory.cafiles, [ENTERPRISE_CA])
+        self.assertEqual(len(urlopen.requests), 1)
+
+    def test_a_complement_ssl_refuses_names_that_complement(self):
+        """The second store is checked as strictly as the first, and the
+        message points at the file that is actually broken - naming the first
+        one would send an operator to fix a file that is perfectly fine."""
+        client, _, urlopen = self._wired(
+            "", ENTERPRISE_CA, (ENTERPRISE_CA, SPLUNK_CA), "corp-root-ca",
+            load_raises=ssl.SSLError("no start line"),
+        )
+        capabilities, failure = client.get_capabilities()
+        self.assertIsNone(capabilities)
+        self.assertEqual(failure.kind, rest.FAILURE_CA_FILE)
+        self.assertIn(SPLUNK_CA, failure.message)
+        self.assertNotIn(ENTERPRISE_CA, failure.message)
+        self.assertEqual(urlopen.requests, [])
+
+    def test_the_shipped_sslrootcapath_is_not_loaded_twice(self):
+        """`server.conf` ships `sslRootCAPath` spelled at `cacert.pem` itself.
+        The complement is then the same file: one store, named once."""
+        resolution = rest.resolve_ca_file(
+            "", "$SPLUNK_HOME/etc/auth/cacert.pem", SPLUNK_HOME,
+            _present(SPLUNK_CA),
+        )
+        self.assertEqual(len(resolution.stores), 1)
+        self.assertEqual(resolution.path, SPLUNK_CA)
+
+    def test_an_absent_truststore_leaves_the_declaration_alone(self):
+        """Nobody configured `cacert.pem`, so its absence is not a
+        configuration error - only a DECLARED store can refuse."""
+        resolution = rest.resolve_ca_file(
+            "", ENTERPRISE_CA, SPLUNK_HOME, _present(ENTERPRISE_CA)
+        )
+        self.assertEqual(len(resolution.stores), 1)
+        self.assertIsNone(resolution.refusal)
+
+    # -- the message names every store ----------------------------------- #
+
+    def test_the_tls_message_names_both_stores_and_both_sources(self):
+        """Quoted whole rather than probed: an operator must read the sentence
+        and know, without guessing, that TWO authority sets were loaded and
+        which file each of them came from."""
+        client, _, _ = self._wired(
+            "", ENTERPRISE_CA, (ENTERPRISE_CA, SPLUNK_CA), "an-unknown-ca",
+        )
+        _, failure = client.get_capabilities()
+        self.assertEqual(
+            failure.message,
+            "TLS verification of the splunkd certificate failed against every "
+            "CA store loaded: %s (from %s), %s (from %s). If splunkd carries "
+            "an enterprise certificate, declare its CA in server.conf "
+            "[sslConfig] sslRootCAPath, or point [rest] ca_file of "
+            "SA-conf-audit/local/confbtool.conf at it" % (
+                ENTERPRISE_CA, rest.CA_SOURCE_SERVER_CONF,
+                SPLUNK_CA, rest.CA_SOURCE_SPLUNK_DEFAULT,
+            ),
+        )
 
 
 class CaPathAdversarialTest(RestTestCase):
@@ -655,7 +914,14 @@ class SslRootCaPathReadingTest(RestTestCase):
 class ResolutionReachesSslTest(RestTestCase):
     """End to end: what `server.conf` declares is what `ssl` is handed."""
 
-    def test_the_enterprise_ca_is_the_store_handed_to_ssl(self):
+    def test_the_enterprise_ca_is_the_first_store_handed_to_ssl(self):
+        """The enterprise CA leads, and the truststore is CUMULATED after it.
+
+        Asserted on `contexts[0].loaded`, not on `cafiles` alone: a cumulated
+        store never goes through `create_default_context`, so `cafiles` would
+        stay `[ENTERPRISE_CA]` whether the second store was loaded or silently
+        dropped - a test that could not tell the two apart.
+        """
         factory = self.use_context_factory(_ContextFactory())
         resolution = rest.resolve_ca_file(
             "",
@@ -668,7 +934,7 @@ class ResolutionReachesSslTest(RestTestCase):
         )
         self.client(ca=resolution)
         self.assertEqual(factory.cafiles, [ENTERPRISE_CA])
-        self.assertNotIn(SPLUNK_CA, factory.cafiles)
+        self.assertEqual(factory.contexts[0].loaded, [ENTERPRISE_CA, SPLUNK_CA])
 
     def test_without_a_declaration_the_truststore_is_handed_to_ssl(self):
         factory = self.use_context_factory(_ContextFactory())

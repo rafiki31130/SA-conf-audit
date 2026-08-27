@@ -40,14 +40,21 @@ SERVER_INFO_PATH = "/services/server/info?output_mode=json"
 # CA store resolution (spec section 2.2; charter CH-9.13, CH-9.14, CH-9.19).
 #
 # CH-9.19 asks that the retained resolution path be NAMED and that the
-# forbidden ones be named with their failure mode. Retained, strongest first:
-# `[rest] ca_file`, then `server.conf [sslConfig] sslRootCAPath`, then Splunk's
-# own truststore. Forbidden, and why:
+# forbidden ones be named with their failure mode. Retained: `[rest] ca_file`
+# alone when it is set - an explicit escape hatch stays exclusive - otherwise
+# `server.conf [sslConfig] sslRootCAPath` AND Splunk's own truststore,
+# CUMULATED in one context. Forbidden, and why:
 #
 # - hardcoding `$SPLUNK_HOME/etc/auth/cacert.pem` as the ONLY store (what
 #   1.3.0 did): on any member whose splunkd certificate was replaced by an
 #   enterprise one, the chain is not in that file and every verification
 #   fails - while the information needed sits in `server.conf`, unread;
+# - making `sslRootCAPath` EXCLUDE the truststore (what 1.4.0 first did): the
+#   symmetric failure, and a regression on a working installation. A member
+#   that kept its original splunkd certificate, on an instance whose
+#   administrator had filled `sslRootCAPath` for unrelated purposes, verified
+#   against `cacert.pem` in 1.3.0 and was refused in 1.4.0 by an enterprise CA
+#   that had signed nothing. The two stores are cumulated instead;
 # - leaning on the vendored SDK's REST client for the TLS layer: its default
 #   is `verify=False`, so it would trade a broken verification for no
 #   verification at all. `urllib` + `ssl` is used directly, here and nowhere
@@ -90,14 +97,16 @@ FAILURE_UNREADABLE = "unreadable_answer"
 FAILURE_HTTP = "http_error"
 FAILURE_NETWORK = "endpoint_unreachable"
 
-#: Names TLS, names the CA store actually used, and names the file to edit -
-#: the three things that turn this failure into an immediate diagnosis
-#: (CH-9.13). `%s` = store, resolution path.
+#: Names TLS, names EVERY CA store actually loaded with its own resolution
+#: path, and names the file to edit - the three things that turn this failure
+#: into an immediate diagnosis (CH-9.13). Naming all of them is not cosmetic:
+#: since the stores cumulate, an operator reading a single name would have to
+#: guess whether the other one was in play. `%s` = the rendered store list.
 TLS_MESSAGE = (
-    "TLS verification of the splunkd certificate failed against the CA store "
-    "%s, resolved from %s. If splunkd carries an enterprise certificate, "
-    "declare its CA in server.conf [sslConfig] sslRootCAPath, or point "
-    "[rest] ca_file of SA-conf-audit/local/confbtool.conf at it"
+    "TLS verification of the splunkd certificate failed against every CA "
+    "store loaded: %s. If splunkd carries an enterprise certificate, declare "
+    "its CA in server.conf [sslConfig] sslRootCAPath, or point [rest] ca_file "
+    "of SA-conf-audit/local/confbtool.conf at it"
 )
 
 #: A store that was configured but cannot be used at all. Distinct from
@@ -313,19 +322,31 @@ def expand_ca_path(raw, splunk_home):
 def resolve_ca_file(configured, ssl_root_ca_path, splunk_home, exists):
     """The CA store to verify the splunkd chain against, and WHERE it comes from.
 
-    Precedence, strongest first:
+    Three cases, and only the first is exclusive:
 
-    a. `[rest] ca_file` of the app's own `confbtool.conf` - the explicit escape
-       hatch, for whatever the two paths below do not cover;
-    b. `server.conf [sslConfig] sslRootCAPath` - what the INSTANCE itself
-       declares as its trust anchor. This is the path 1.3.0 was missing: on a
-       member whose splunkd certificate was replaced by an enterprise one, the
-       enterprise CA is declared right there, and the app simply did not read
-       it;
-    c. `$SPLUNK_HOME/etc/auth/cacert.pem` - Splunk's own truststore, the 1.3.0
-       behavior, kept as the fallback.
+    a. `[rest] ca_file` of the app's own `confbtool.conf` is set - it is
+       loaded ALONE. An explicit escape hatch is posted by an administrator
+       who wants an exact set of authorities, and quietly adding others would
+       take that control away. The key is new in 1.4.0, so its exclusivity
+       cannot break an installation that predates it;
+    b. otherwise `server.conf [sslConfig] sslRootCAPath` - what the INSTANCE
+       itself declares as its trust anchor - is CUMULATED with
+       `$SPLUNK_HOME/etc/auth/cacert.pem` whenever both are there. This is the
+       case 1.3.0 could not serve (the enterprise CA sat in `server.conf`,
+       unread) and the case exclusive precedence then broke in the other
+       direction (an original splunkd certificate refused by an enterprise CA
+       that had signed nothing). Both authorities loaded, both verify;
+    c. neither is configured - `$SPLUNK_HOME/etc/auth/cacert.pem` alone, the
+       1.3.0 behavior.
 
-    A path resolved by (a) or (b) is RETAINED even when it does not exist:
+    Cumulating never weakens anything: `load_verify_locations` ADDS
+    authorities to a context and removes none. What it must not do is mask a
+    configuration error, and it does not: a DECLARED store - (a) or the
+    `sslRootCAPath` of (b) - that is absent, unreadable or refused by `ssl`
+    still fails the run closed. The complement is added to a working store,
+    never substituted for a broken one.
+
+    A path DECLARED by (a) or (b) is RETAINED even when it does not exist:
     `exists=False` travels into the diagnostic. A typo in `ca_file` must be
     visible as a typo, not silently downgraded to another store that happens
     to work - a silent downgrade is how a verification ends up anchored
@@ -349,14 +370,61 @@ def resolve_ca_file(configured, ssl_root_ca_path, splunk_home, exists):
 
     declared = (ssl_root_ca_path or "").strip()
     if declared:
-        return _configured_resolution(declared, CA_SOURCE_SERVER_CONF,
-                                      splunk_home, exists)
+        resolution = _configured_resolution(declared, CA_SOURCE_SERVER_CONF,
+                                            splunk_home, exists)
+        truststore = _splunk_truststore(splunk_home, exists)
+        # Cumulate only onto a store that is itself usable. Attaching a
+        # complement to a declaration that is refused or missing would list, in
+        # the diagnostic, a store that was never loaded - and would put the
+        # fail-closed refusal one careless edit away from becoming the silent
+        # fallback this resolution exists to forbid.
+        if (resolution.refusal is None and resolution.exists
+                and truststore is not None
+                and truststore.path != resolution.path):
+            return CaResolution(
+                resolution.path, resolution.source, resolution.exists,
+                None, (truststore,),
+            )
+        return resolution
 
-    if splunk_home:
-        path = _join(splunk_home, SPLUNK_CA_RELATIVE)
-        if exists(path):
-            return CaResolution(path, CA_SOURCE_SPLUNK_DEFAULT, True)
+    truststore = _splunk_truststore(splunk_home, exists)
+    if truststore is not None:
+        return truststore
     return CaResolution("", CA_SOURCE_SYSTEM_STORE, True)
+
+
+def _store_text(store):
+    """One store, named with the resolution path it came from."""
+    if not store.path:
+        return store.source
+    return "%s (from %s)" % (store.path, store.source)
+
+
+def _stores_text(stores):
+    """Every store handed to `ssl`, in load order (CH-4.12, CH-9.13).
+
+    The whole list, never just the first: the stores cumulate, so an operator
+    shown a single name could not tell whether the verification had one
+    authority set or two, nor which one to fix.
+    """
+    if not stores:
+        return CA_SOURCE_SYSTEM_STORE
+    return ", ".join(_store_text(store) for store in stores)
+
+
+def _splunk_truststore(splunk_home, exists):
+    """`$SPLUNK_HOME/etc/auth/cacert.pem`, or `None` when it is not there.
+
+    Never a refusal: this store is a COMPLEMENT nobody configured, so its
+    absence is not a configuration error and must not fail the run. Only a
+    store somebody declared can refuse.
+    """
+    if not splunk_home:
+        return None
+    path = _join(splunk_home, SPLUNK_CA_RELATIVE)
+    if not exists(path):
+        return None
+    return CaResolution(path, CA_SOURCE_SPLUNK_DEFAULT, True)
 
 
 def _configured_resolution(raw, source, splunk_home, exists):
@@ -461,10 +529,23 @@ class RestClient:
     def _build_context(self, verify_ssl):
         """TLS context per `[rest] verify_ssl` (spec section 2.2).
 
-        `verify_ssl=true`: chain verified against the RESOLVED CA store,
+        `verify_ssl=true`: chain verified against EVERY resolved CA store,
         hostname check disabled - the splunkd URI is a loopback address and
         the default Splunk certificates carry no matching SAN. The hostname is
         not the variable in play here; the chain of trust is.
+
+        The stores are loaded in order, the first through
+        `create_default_context(cafile=...)` and each further one through
+        `load_verify_locations`, which ADDS its authorities to the same
+        context. Trust only ever grows, so no store loaded here can make the
+        verification accept less than it would have accepted alone.
+
+        Growing trust is not the same as forgiving a mistake, and the two are
+        kept apart on purpose: every store is checked BEFORE anything is
+        loaded, and a declared store that is missing fails the run closed even
+        when the other one would have verified. A cumulation that quietly
+        carried on over a broken `sslRootCAPath` would be the silent fallback
+        of A1 wearing a different hat.
 
         `verify_ssl=false`: no verification (the wrapper emits a single
         startup warning).
@@ -482,15 +563,26 @@ class RestClient:
         if self._ca.refusal is not None:
             self._context_failure = self._refusal_failure()
             return
-        if self._ca.path and not self._ca.exists:
-            self._context_failure = self._ca_file_failure()
-            return
+
+        stores = self._ca.stores
+        for store in stores:
+            if store.path and not store.exists:
+                self._context_failure = self._ca_file_failure(store)
+                return
+
+        first = stores[0]
         try:
-            context = ssl.create_default_context(cafile=self._ca.path or None)
+            context = ssl.create_default_context(cafile=first.path or None)
         except (OSError, ValueError):
             # Absent, unreadable, or not a PEM bundle at all.
-            self._context_failure = self._ca_file_failure()
+            self._context_failure = self._ca_file_failure(first)
             return
+        for store in stores[1:]:
+            try:
+                context.load_verify_locations(cafile=store.path)
+            except (OSError, ValueError):
+                self._context_failure = self._ca_file_failure(store)
+                return
         context.check_hostname = False
         self._context = context
 
@@ -506,11 +598,18 @@ class RestClient:
             return self._ca_file_failure()
         return RestFailure(FAILURE_CA_FILE, message % self._ca.source)
 
-    def _ca_file_failure(self):
+    def _ca_file_failure(self, store=None):
+        """The refusal of ONE store, named as the store it is.
+
+        The offending store travels in rather than being read off `self._ca`:
+        with several stores loaded, a message that always named the first
+        would send an operator to fix a file that is perfectly fine.
+        """
+        store = store if store is not None else self._ca
         return RestFailure(
             FAILURE_CA_FILE,
-            CA_FILE_MESSAGE % (self._ca.path or CA_SOURCE_SYSTEM_STORE,
-                               self._ca.source),
+            CA_FILE_MESSAGE % (store.path or CA_SOURCE_SYSTEM_STORE,
+                               store.source),
         )
 
     def _get_json(self, path):
@@ -569,9 +668,7 @@ class RestClient:
         candidates = (exc, reason)
         if any(isinstance(item, ssl.SSLError) for item in candidates):
             return RestFailure(
-                FAILURE_TLS,
-                TLS_MESSAGE % (self._ca.path or CA_SOURCE_SYSTEM_STORE,
-                               self._ca.source),
+                FAILURE_TLS, TLS_MESSAGE % _stores_text(self._ca.stores)
             )
         if any(_is_timeout(item) for item in candidates):
             return RestFailure(

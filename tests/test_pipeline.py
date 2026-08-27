@@ -26,6 +26,13 @@ from tests.helpers import (
 
 ETC = "/opt/splunk/etc"
 
+#: A TLS failure as `rest.py` renders it once TWO stores are loaded - the
+#: nominal shape since the enterprise CA and the Splunk truststore cumulate.
+_TWO_STORES = (
+    "/opt/splunk/etc/auth/corp-root-ca.pem (from %s), "
+    "/opt/splunk/etc/auth/cacert.pem (from %s)"
+) % (rest.CA_SOURCE_SERVER_CONF, rest.CA_SOURCE_SPLUNK_DEFAULT)
+
 
 def _run(fs, btool, rest=None, **kwargs):
     kwargs.setdefault("fieldnames", ["probe"])
@@ -128,9 +135,7 @@ class CapabilityCheckFailureTest(unittest.TestCase):
         """Every nature of failure travels intact - the pipeline relays what
         the adapter measured, it never re-guesses it."""
         for kind, reason in (
-            (rest.FAILURE_TLS,
-             rest.TLS_MESSAGE % ("/opt/splunk/etc/auth/corp-root-ca.pem",
-                                 rest.CA_SOURCE_SERVER_CONF)),
+            (rest.FAILURE_TLS, rest.TLS_MESSAGE % _TWO_STORES),
             (rest.FAILURE_AUTH, rest.AUTH_MESSAGE % 401),
             (rest.FAILURE_TIMEOUT, rest.TIMEOUT_MESSAGE % 30),
             (rest.FAILURE_UNREADABLE,
@@ -139,17 +144,20 @@ class CapabilityCheckFailureTest(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertIn(reason, self._refusal(RestFailure(kind, reason)))
 
-    def test_the_tls_reason_names_the_ca_file_that_was_used(self):
+    def test_the_tls_reason_names_every_ca_file_that_was_used(self):
         """The acceptance criterion of the fix: an operator reads the refusal
-        and knows which store the chain was checked against."""
-        message = self._refusal(RestFailure(
-            rest.FAILURE_TLS,
-            rest.TLS_MESSAGE % ("/opt/splunk/etc/auth/corp-root-ca.pem",
-                                rest.CA_SOURCE_SERVER_CONF),
-        ))
+        and knows which stores the chain was checked against - ALL of them.
+
+        Since the stores cumulate, naming one would leave the reader guessing
+        whether the other was in play, and which of the two to go and fix.
+        """
+        message = self._refusal(
+            RestFailure(rest.FAILURE_TLS, rest.TLS_MESSAGE % _TWO_STORES)
+        )
         self.assertIn("TLS", message)
         self.assertIn("/opt/splunk/etc/auth/corp-root-ca.pem", message)
         self.assertIn("sslRootCAPath", message)
+        self.assertIn("/opt/splunk/etc/auth/cacert.pem", message)
 
     def test_a_port_that_reports_nothing_still_refuses_and_says_so(self):
         message = self._refusal(None)

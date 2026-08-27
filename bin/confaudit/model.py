@@ -266,14 +266,30 @@ class AppSettings:
 
 @dataclass(frozen=True)
 class CaResolution:
-    """The CA store the splunkd chain verification is anchored on.
+    """The CA stores the splunkd chain verification is anchored on.
 
-    `path` is what is handed to `ssl`; the empty string means the platform's
-    own default trust store. `source` is the human label of the resolution
-    path RETAINED - it is quoted verbatim in the diagnostic, so that reading
-    the error message is enough to know which of the three paths won. `exists`
-    says whether `path` was found on disk: a configured but absent file is
-    kept here and reported, never silently downgraded to another store.
+    `path` is the store handed to `ssl` FIRST; the empty string means the
+    platform's own default trust store. `source` is the human label of the
+    resolution path it came from - quoted verbatim in the diagnostic, so that
+    reading the error message is enough to know where the store came from.
+    `exists` says whether `path` was found on disk: a configured but absent
+    file is kept here and reported, never silently downgraded to another
+    store.
+
+    `also` carries the stores CUMULATED with `path` - each one a
+    `CaResolution` of its own, so one shape describes a store wherever it
+    sits. Trust is additive: `ssl.SSLContext.load_verify_locations` ADDS
+    authorities to a context and removes none, so loading a second store can
+    only widen what verifies, never weaken the verification itself. `stores`
+    is the ordered tuple actually handed to `ssl`, `path` first.
+
+    The cumulation exists because exclusive precedence broke a working
+    installation: a member that kept its ORIGINAL splunkd certificate, on an
+    instance whose administrator had filled `sslRootCAPath` with an
+    enterprise CA for unrelated purposes, verified fine in 1.3.0 against
+    `cacert.pem` and was refused in 1.4.0, since the enterprise CA outranked
+    the truststore and had signed nothing. Cumulated, both authorities are
+    present and both configurations verify.
 
     `refusal` is the machine handle of a store that was CONFIGURED and that
     the resolution refuses outright - one of the `REFUSAL_*` constants of
@@ -289,6 +305,12 @@ class CaResolution:
     source: str
     exists: bool
     refusal: Optional[str] = None
+    also: Tuple["CaResolution", ...] = ()
+
+    @property
+    def stores(self):
+        """The stores handed to `ssl`, in load order - `path` first."""
+        return (self,) + self.also
 
 
 @dataclass(frozen=True)
